@@ -53,10 +53,10 @@ async def on_ready():
         print(f"❌ Error syncing slash commands: {e}")
 
 
-@bot.tree.command(name="sync_categories", description="Sync categories from the source server",
+@bot.tree.command(name="exclude_category", description="Exclude a category from syncing",
                   guild=discord.Object(id=DESTINATION_SERVER_ID))
-async def sync_categories(interaction: discord.Interaction):
-    """Sync categories from the database and create them in the destination server, excluding certain categories."""
+async def exclude_category(interaction: discord.Interaction, category_id: str):
+    """Adds a category ID to the exclusion list so it won't be synced."""
     await interaction.response.defer(thinking=True)
 
     conn = connect_db()
@@ -65,41 +65,27 @@ async def sync_categories(interaction: discord.Interaction):
         return
 
     cursor = conn.cursor()
+    try:
+        # Check if category exists in the database
+        cursor.execute("SELECT category_name FROM categories WHERE category_id = %s;", (category_id,))
+        category = cursor.fetchone()
 
-    # Get excluded categories
-    cursor.execute("SELECT category_id FROM excluded_categories;")
-    excluded_categories = {row[0] for row in cursor.fetchall()}
+        if not category:
+            await interaction.followup.send(f"❌ Category with ID `{category_id}` not found in the database.")
+            return
 
-    # Fetch categories
-    cursor.execute("SELECT category_id, category_name FROM categories;")
-    categories = cursor.fetchall()
+        # Insert into excluded_categories table
+        cursor.execute("INSERT INTO excluded_categories (category_id) VALUES (%s) ON CONFLICT DO NOTHING;", (category_id,))
+        conn.commit()
 
-    if not categories:
-        await interaction.followup.send("❌ No categories found in the database!")
-        return
+        await interaction.followup.send(f"✅ Excluded category `{category[0]}` (ID: `{category_id}`) from syncing.")
+        print(f"⏩ Category {category[0]} ({category_id}) is now excluded.")
 
-    destination_guild = discord.utils.get(bot.guilds, id=DESTINATION_SERVER_ID)
-    if not destination_guild:
-        await interaction.followup.send("❌ Destination server not found.")
-        return
-
-    response = "📂 **Creating Missing Categories:**\n"
-    for category_id, category_name in categories:
-        if category_id in excluded_categories:
-            print(f"⏩ Skipping excluded category: {category_name}")
-            continue  # Skip excluded categories
-
-        existing_category = discord.utils.get(destination_guild.categories, name=category_name)
-        if existing_category:
-            response += f"✅ Already exists: {category_name}\n"
-            continue
-
-        new_category = await destination_guild.create_category(name=category_name)
-        response += f"✅ Created: {category_name}\n"
-
-    await interaction.followup.send(response)
-    cursor.close()
-    conn.close()
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error excluding category: {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 @bot.tree.command(name="force_sync", description="Force a full sync of categories & channels",
                   guild=discord.Object(id=DESTINATION_SERVER_ID))

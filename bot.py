@@ -97,18 +97,35 @@ class SelfBot(discord.Client):
         if not webhook_url:
             return
 
-        # Save message in PostgreSQL
+        has_attachment = False
+        attachment_data = []
+
+        # Process attachments
+        if message.attachments:
+            has_attachment = True
+            for attachment in message.attachments:
+                attachment_data.append((str(message.id), attachment.url, attachment.filename, attachment.size))
+
+        # Save message & attachments in PostgreSQL
         conn = connect_db()
         if conn:
             cursor = conn.cursor()
             try:
                 cursor.execute(
-                    "INSERT INTO messages (message_id, channel_id, content, author_id, timestamp) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (message_id) DO NOTHING;",
+                    "INSERT INTO messages (message_id, channel_id, content, author_id, timestamp, has_attachment) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (message_id) DO NOTHING;",
                     (str(message.id), str(message.channel.id), message.content, str(message.author.id),
-                     message.created_at)
+                     message.created_at, has_attachment)
                 )
+
+                # Insert attachments if available
+                if has_attachment:
+                    cursor.executemany(
+                        "INSERT INTO attachments (message_id, url, filename, size) VALUES (%s, %s, %s, %s);",
+                        attachment_data
+                    )
+
                 conn.commit()
-                print(f"📩 Stored message {message.id} from {message.author}")
+                print(f"📩 Stored message {message.id} from {message.author} with {len(attachment_data)} attachment(s).")
             except Exception as e:
                 print(f"❌ Error inserting message: {e}")
             finally:
@@ -118,6 +135,11 @@ class SelfBot(discord.Client):
         # Prepare webhook message
         webhook = DiscordWebhook(url=webhook_url, content=message.content, username=message.author.name,
                                  avatar_url=str(message.author.avatar_url))
+
+        # Add attachments to webhook
+        for attachment in message.attachments:
+            webhook.add_file(url=attachment.url, filename=attachment.filename)
+
         webhook.execute()
 
     async def on_message_edit(self, before, after):

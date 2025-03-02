@@ -20,6 +20,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 
+DESTINATION_SERVER_ID = int(os.getenv("DESTINATION_SERVER_ID"))
 
 # Connect to PostgreSQL
 def connect_db():
@@ -102,6 +103,13 @@ class SelfBot(discord.Client):
 
     async def on_ready(self):
         print(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
+
+        # Verify the bot has access to the destination server
+        destination_guild = discord.utils.get(self.guilds, id=DESTINATION_SERVER_ID)
+        if destination_guild:
+            print(f"✅ Destination Server: {destination_guild.name} (ID: {destination_guild.id})")
+        else:
+            print(f"❌ ERROR: Bot is not in the destination server!")
 
         excluded_categories = get_excluded_categories()
 

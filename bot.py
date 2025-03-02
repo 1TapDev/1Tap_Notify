@@ -90,7 +90,7 @@ def get_webhook_for_channel(channel_id):
         conn.close()
 
 def get_excluded_categories():
-    """Retrieve a list of category IDs to exclude from mirroring."""
+    """Retrieve a set of category IDs to exclude from mirroring."""
     conn = connect_db()
     if not conn:
         return set()

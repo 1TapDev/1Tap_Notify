@@ -44,14 +44,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"✅ Destination bot logged in as {bot.user}")
-    await bot.tree.sync(guild=discord.Object(id=DESTINATION_SERVER_ID))  # ✅ Use bot.tree instead of tree
-    print(f"✅ Slash commands synced for {bot.user} in server {DESTINATION_SERVER_ID}")
+
+    try:
+        bot.tree.clear_commands(guild=discord.Object(id=DESTINATION_SERVER_ID))  # Ensure clean state
+        await bot.tree.sync(guild=discord.Object(id=DESTINATION_SERVER_ID))  # Register commands
+        print(f"✅ Slash commands synced for {bot.user} in server {DESTINATION_SERVER_ID}")
+    except Exception as e:
+        print(f"❌ Error syncing slash commands: {e}")
+
 
 @bot.tree.command(name="sync_categories", description="Sync categories from the source server",
                   guild=discord.Object(id=DESTINATION_SERVER_ID))
 async def sync_categories(interaction: discord.Interaction):
-    """Sync categories from the database."""
-    await interaction.response.defer(thinking=True)  # Indicate processing
+    """Sync categories from the database and create them in the destination server, excluding certain categories."""
+    await interaction.response.defer(thinking=True)
 
     conn = connect_db()
     if not conn:
@@ -59,59 +65,41 @@ async def sync_categories(interaction: discord.Interaction):
         return
 
     cursor = conn.cursor()
+
+    # Get excluded categories
+    cursor.execute("SELECT category_id FROM excluded_categories;")
+    excluded_categories = {row[0] for row in cursor.fetchall()}
+
+    # Fetch categories
     cursor.execute("SELECT category_id, category_name FROM categories;")
     categories = cursor.fetchall()
 
     if not categories:
         await interaction.followup.send("❌ No categories found in the database!")
-    else:
-        response = "📂 **Categories to Sync:**\n"
-        for category_id, category_name in categories:
-            response += f"- {category_name} (ID: {category_id})\n"
+        return
 
-        await interaction.followup.send(response)
+    destination_guild = discord.utils.get(bot.guilds, id=DESTINATION_SERVER_ID)
+    if not destination_guild:
+        await interaction.followup.send("❌ Destination server not found.")
+        return
 
+    response = "📂 **Creating Missing Categories:**\n"
+    for category_id, category_name in categories:
+        if category_id in excluded_categories:
+            print(f"⏩ Skipping excluded category: {category_name}")
+            continue  # Skip excluded categories
+
+        existing_category = discord.utils.get(destination_guild.categories, name=category_name)
+        if existing_category:
+            response += f"✅ Already exists: {category_name}\n"
+            continue
+
+        new_category = await destination_guild.create_category(name=category_name)
+        response += f"✅ Created: {category_name}\n"
+
+    await interaction.followup.send(response)
     cursor.close()
     conn.close()
-    try:
-        # Fetch categories from the database
-        cursor.execute("SELECT category_id, category_name FROM categories;")
-        categories = cursor.fetchall()
-
-        for category_id, category_name in categories:
-            # Check if category exists in the destination server
-            existing_category = discord.utils.get(ctx.guild.categories, name=category_name)
-            if existing_category:
-                print(f"✅ Category {category_name} already exists.")
-                continue
-
-            # Create the category
-            new_category = await ctx.guild.create_category(category_name)
-            print(f"📂 Created category {category_name}")
-
-            # Fetch channels under this category
-            cursor.execute("SELECT channel_id, channel_name FROM channels WHERE category_id = %s;", (category_id,))
-            channels = cursor.fetchall()
-
-            for channel_id, channel_name in channels:
-                # Create the channel in the new category
-                new_channel = await ctx.guild.create_text_channel(name=channel_name, category=new_category)
-                print(f"📌 Created channel {channel_name}")
-
-                # Create a webhook for this channel
-                webhook = await new_channel.create_webhook(name="MirrorWebhook")
-                webhook_url = webhook.url
-
-                # Store webhook in the database
-                cursor.execute("INSERT INTO destination_webhooks (channel_id, webhook_url) VALUES (%s, %s) ON CONFLICT (channel_id) DO NOTHING;", (str(channel_id), webhook_url))
-                conn.commit()
-                print(f"🔗 Created webhook for {channel_name}")
-
-    except Exception as e:
-        print(f"❌ Error syncing categories: {e}")
-    finally:
-        cursor.close()
-        conn.close()
 
 @bot.tree.command(name="force_sync", description="Force a full sync of categories & channels",
                   guild=discord.Object(id=DESTINATION_SERVER_ID))

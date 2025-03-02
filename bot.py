@@ -124,9 +124,47 @@ class SelfBot(discord.Client):
 
     async def on_ready(self):
         print(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
+        await self.store_server_structure()  # Store categories & channels when the bot starts
 
-        # No longer checking if the self-bot is in the destination server
-        print("✅ Self-bot is running. Monitoring source servers only.")
+    async def store_server_structure(self):
+        """Fetch and store categories & channels from source servers."""
+        conn = connect_db()
+        if not conn:
+            return
+        cursor = conn.cursor()
+
+        for guild in self.guilds:
+            if str(guild.id) not in self.monitored_servers:
+                continue  # Skip unmonitored servers
+
+            print(f"📂 Storing structure for {guild.name} ({guild.id})")
+
+            # Store categories
+            for category in guild.categories:
+                cursor.execute("""
+                    INSERT INTO categories (category_id, category_name, server_id) 
+                    VALUES (%s, %s, %s) ON CONFLICT (category_id) DO NOTHING;
+                """, (str(category.id), category.name, str(guild.id)))
+                print(f"✅ Stored category: {category.name}")
+
+            # Store text channels
+            for channel in guild.text_channels:
+                cursor.execute("""
+                    INSERT INTO channels (category_id, category_name, channel_id, channel_name, server_id) 
+                    VALUES (%s, %s, %s, %s, %s) ON CONFLICT (channel_id) DO NOTHING;
+                """, (
+                    str(channel.category_id) if channel.category else None,
+                    channel.category.name if channel.category else None,
+                    str(channel.id),
+                    channel.name,
+                    str(guild.id)
+                ))
+                print(f"✅ Stored channel: {channel.name}")
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("✅ Finished storing server structure.")
 
     async def on_message(self, message):
         if message.guild and str(message.guild.id) not in self.monitored_servers:

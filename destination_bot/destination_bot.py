@@ -57,7 +57,7 @@ async def sync_categories(interaction: discord.Interaction):
         return
 
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT category_id, category_name FROM channels WHERE category_id IS NOT NULL;")
+    cursor.execute("SELECT category_id, category_name FROM categories;")
     categories = cursor.fetchall()
 
     if not categories:
@@ -73,7 +73,7 @@ async def sync_categories(interaction: discord.Interaction):
     conn.close()
     try:
         # Fetch categories from the database
-        cursor.execute("SELECT DISTINCT category_id, category_name FROM channels WHERE category_id IS NOT NULL;")
+        cursor.execute("SELECT category_id, category_name FROM categories;")
         categories = cursor.fetchall()
 
         for category_id, category_name in categories:
@@ -127,20 +127,26 @@ async def sync_permissions(ctx):
         categories = cursor.fetchall()
 
         for category_id, category_name in categories:
-            dest_category = discord.utils.get(ctx.guild.categories, name=category_name)
-            if not dest_category:
+            existing_category = discord.utils.get(ctx.guild.categories, name=category_name)
+            if existing_category:
+                print(f"✅ Category {category_name} already exists.")
                 continue
 
-            # Fetch source permissions
-            cursor.execute("SELECT role_id, permissions FROM category_permissions WHERE category_id = %s;", (category_id,))
+            # Fetch category permissions from source server
+            cursor.execute("SELECT role_id, permissions FROM category_permissions WHERE category_id = %s;",
+                           (category_id,))
             permissions = cursor.fetchall()
+            overwrites = {}
 
             for role_id, permission in permissions:
                 role = ctx.guild.get_role(int(role_id))
                 if role:
                     overwrite = discord.PermissionOverwrite(**eval(permission))
-                    await dest_category.set_permissions(role, overwrite=overwrite)
-                    print(f"🔑 Synced permissions for {role.name} in {category_name}")
+                    overwrites[role] = overwrite
+
+            # Create the category with permissions
+            new_category = await ctx.guild.create_category(category_name, overwrites=overwrites)
+            print(f"📂 Created category {category_name} with permissions")
 
     except Exception as e:
         print(f"❌ Error syncing permissions: {e}")

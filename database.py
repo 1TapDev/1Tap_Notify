@@ -83,5 +83,44 @@ def initialize_tables():
         cursor.close()
         conn.close()
 
+def insert_server(server_id, server_name):
+    """Insert a new server into the database."""
+    conn = connect_db()
+    if not conn:
+        return
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO servers (server_id, server_name) VALUES (%s, %s) ON CONFLICT (server_id) DO NOTHING;",
+            (server_id, server_name)
+        )
+        conn.commit()
+        print(f"Server {server_name} added successfully.")
+    except Exception as e:
+        print(f"Error inserting server: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+def fetch_servers():
+    """Retrieve all servers from the database."""
+    conn = connect_db()
+    if not conn:
+        return []
+    cursor = conn.cursor(cursor_factory=DictCursor)
+    try:
+        cursor.execute("SELECT * FROM servers;")
+        servers = cursor.fetchall()
+        return servers
+    except Exception as e:
+        print(f"Error fetching servers: {e}")
+        return []
+    finally:
+        cursor.close()
+        conn.close()
+
 if __name__ == "__main__":
-    initialize_tables()
+    insert_server("123456789012345678", "Test Server")
+    servers = fetch_servers()
+    for server in servers:
+        print(dict(server))

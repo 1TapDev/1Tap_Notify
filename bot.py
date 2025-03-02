@@ -197,6 +197,62 @@ class SelfBot(discord.Client):
             webhook = DiscordWebhook(url=webhook_url, content=f"🗑 **Message Deleted**", username=message.author.name)
             webhook.execute()
 
+    async def on_thread_create(self, thread):
+        """Detect and store new threads."""
+        if str(thread.guild.id) not in self.monitored_servers:
+            return  # Ignore threads from unmonitored servers
+
+        conn = connect_db()
+        if conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO threads (thread_id, channel_id, name, creator_id, created_at) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (thread_id) DO NOTHING;",
+                    (str(thread.id), str(thread.parent.id), thread.name, str(thread.owner_id), thread.created_at)
+                )
+                conn.commit()
+                print(f"🧵 Created thread: {thread.name} in {thread.parent.name}")
+            except Exception as e:
+                print(f"❌ Error inserting thread: {e}")
+            finally:
+                cursor.close()
+                conn.close()
+
+        # Forward thread creation to webhook
+        webhook_url = get_webhook_for_channel(str(thread.parent.id))
+        if webhook_url:
+            webhook = DiscordWebhook(url=webhook_url, content=f"🧵 **New Thread Created:** {thread.name}",
+                                     username="Thread Bot")
+            webhook.execute()
+
+    async def on_thread_update(self, before, after):
+        """Detect when a thread is archived or unarchived."""
+        if str(before.guild.id) not in self.monitored_servers:
+            return
+
+        conn = connect_db()
+        if conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE threads SET is_archived = %s WHERE thread_id = %s;",
+                    (after.archived, str(after.id))
+                )
+                conn.commit()
+                status = "archived" if after.archived else "unarchived"
+                print(f"📂 Thread {after.name} has been {status}.")
+            except Exception as e:
+                print(f"❌ Error updating thread: {e}")
+            finally:
+                cursor.close()
+                conn.close()
+
+        # Notify Webhook about archive status
+        webhook_url = get_webhook_for_channel(str(after.parent.id))
+        if webhook_url:
+            status_text = "📂 **Thread Archived:**" if after.archived else "📂 **Thread Unarchived:**"
+            webhook = DiscordWebhook(url=webhook_url, content=f"{status_text} {after.name}", username="Thread Bot")
+            webhook.execute()
 
 # Function to start multiple bots
 async def start_bots():

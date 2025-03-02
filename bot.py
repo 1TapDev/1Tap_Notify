@@ -1,6 +1,8 @@
 import discord
 import asyncio
 import os
+import subprocess
+import sys
 import psycopg2
 import datetime
 from psycopg2.extras import DictCursor
@@ -21,6 +23,9 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 
 DESTINATION_SERVER_ID = int(os.getenv("DESTINATION_SERVER_ID"))
+
+DESTINATION_BOT_PATH = os.path.join(os.getcwd(), "destination_bot", "destination_bot.py")
+VENV_ACTIVATE = os.path.join(os.getcwd(), "destination_bot", ".venv", "Scripts", "activate.bat")  # Windows
 
 # Connect to PostgreSQL
 def connect_db():
@@ -94,6 +99,22 @@ def get_excluded_categories():
         cursor.close()
         conn.close()
 
+def start_destination_bot():
+    """Start the destination bot in a separate process."""
+    if not os.path.exists(DESTINATION_BOT_PATH):
+        print("❌ ERROR: destination_bot.py not found!")
+        return
+
+    print("🚀 Starting Destination Bot...")
+
+    if sys.platform == "win32":
+        command = f'cmd /c ""{VENV_ACTIVATE}" && python "{DESTINATION_BOT_PATH}""'
+    else:
+        venv_activate = os.path.join(os.getcwd(), "destination_bot", ".venv", "bin", "activate")
+        command = f'bash -c "source {venv_activate} && python {DESTINATION_BOT_PATH}"'
+
+    subprocess.Popen(command, shell=True)
+
 # SelfBot class
 class SelfBot(discord.Client):
     def __init__(self, token, monitored_servers, **options):
@@ -104,25 +125,8 @@ class SelfBot(discord.Client):
     async def on_ready(self):
         print(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
 
-        # Verify the bot has access to the destination server
-        destination_guild = discord.utils.get(self.guilds, id=DESTINATION_SERVER_ID)
-        if destination_guild:
-            print(f"✅ Destination Server: {destination_guild.name} (ID: {destination_guild.id})")
-        else:
-            print(f"❌ ERROR: Bot is not in the destination server!")
-
-        excluded_categories = get_excluded_categories()
-
-        for guild in self.guilds:
-            print(f"🔍 Checking {guild.name}")
-
-            for category in guild.categories:
-                if str(category.id) in excluded_categories:
-                    print(f"⏩ Skipping excluded category: {category.name}")
-                    continue  # Skip this category
-
-                # Now, create categories & channels in the destination server
-                await self.sync_category(category)
+        # No longer checking if the self-bot is in the destination server
+        print("✅ Self-bot is running. Monitoring source servers only.")
 
     async def on_message(self, message):
         if message.guild and str(message.guild.id) not in self.monitored_servers:
@@ -354,6 +358,6 @@ async def start_bots():
 
     await asyncio.gather(*[bot.wait_until_ready() for bot in bots])
 
-# Run multiple bots asynchronously
-asyncio.run(start_bots())  # ✅ Corrected
-
+if __name__ == "__main__":
+    start_destination_bot()  # 🚀 Start destination bot automatically
+    asyncio.run(start_bots())  # Start self-bot

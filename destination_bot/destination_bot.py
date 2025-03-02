@@ -1,7 +1,8 @@
 import discord
+from discord.ext import commands
+from discord import app_commands
 import os
 import psycopg2
-from discord.ext import commands
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -32,29 +33,44 @@ def connect_db():
         print(f"Database connection error: {e}")
         return None
 
-# Initialize the bot
+# Define bot with command tree (for slash commands)
 intents = discord.Intents.default()
 intents.guilds = True
-intents.webhooks = True
-intents.manage_channels = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
     print(f"✅ Destination bot logged in as {bot.user}")
+    await bot.tree.sync(guild=discord.Object(id=DESTINATION_SERVER_ID))  # ✅ Use bot.tree instead of tree
+    print(f"✅ Slash commands synced for {bot.user} in server {DESTINATION_SERVER_ID}")
 
-@bot.command()
-async def sync_categories(ctx):
-    """Creates categories and channels in the destination server based on the mirrored data."""
-    if ctx.guild.id != DESTINATION_SERVER_ID:
-        return
+@bot.tree.command(name="sync_categories", description="Sync categories from the source server",
+                  guild=discord.Object(id=DESTINATION_SERVER_ID))
+async def sync_categories(interaction: discord.Interaction):
+    """Sync categories from the database."""
+    await interaction.response.defer(thinking=True)  # Indicate processing
 
     conn = connect_db()
     if not conn:
+        await interaction.followup.send("❌ Database connection failed.")
         return
 
     cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT category_id, category_name FROM channels WHERE category_id IS NOT NULL;")
+    categories = cursor.fetchall()
+
+    if not categories:
+        await interaction.followup.send("❌ No categories found in the database!")
+    else:
+        response = "📂 **Categories to Sync:**\n"
+        for category_id, category_name in categories:
+            response += f"- {category_name} (ID: {category_id})\n"
+
+        await interaction.followup.send(response)
+
+    cursor.close()
+    conn.close()
     try:
         # Fetch categories from the database
         cursor.execute("SELECT DISTINCT category_id, category_name FROM channels WHERE category_id IS NOT NULL;")
@@ -133,3 +149,9 @@ async def sync_permissions(ctx):
         conn.close()
 
 bot.run(DESTINATION_BOT_TOKEN)
+@bot.event
+async def on_message(message):
+    """Debug incoming messages."""
+    print(f"📥 Received message: {message.content} from {message.author} in {message.guild.name}")
+
+    await bot.process_commands(message)  # Ensure commands still work

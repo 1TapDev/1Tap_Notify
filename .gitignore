@@ -1,5 +1,9 @@
 __pycache__/
 *.db
+.venv/
 .env
 *.log
 .idea/
+destination_bot/.idea/
+destination_bot/.venv/
+destination_bot/.env

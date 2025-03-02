@@ -75,6 +75,24 @@ def get_webhook_for_channel(channel_id):
         cursor.close()
         conn.close()
 
+def get_excluded_categories():
+    """Retrieve a list of category IDs to exclude from mirroring."""
+    conn = connect_db()
+    if not conn:
+        return set()
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT category_id FROM excluded_categories;")
+        excluded = {row[0] for row in cursor.fetchall()}
+        return excluded
+    except Exception as e:
+        print(f"Error fetching excluded categories: {e}")
+        return set()
+    finally:
+        cursor.close()
+        conn.close()
+
 # SelfBot class
 class SelfBot(discord.Client):
     def __init__(self, token, monitored_servers, **options):
@@ -84,6 +102,19 @@ class SelfBot(discord.Client):
 
     async def on_ready(self):
         print(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
+
+        excluded_categories = get_excluded_categories()
+
+        for guild in self.guilds:
+            print(f"🔍 Checking {guild.name}")
+
+            for category in guild.categories:
+                if str(category.id) in excluded_categories:
+                    print(f"⏩ Skipping excluded category: {category.name}")
+                    continue  # Skip this category
+
+                # Now, create categories & channels in the destination server
+                await self.sync_category(category)
 
     async def on_message(self, message):
         if message.guild and str(message.guild.id) not in self.monitored_servers:
@@ -253,6 +284,52 @@ class SelfBot(discord.Client):
             status_text = "📂 **Thread Archived:**" if after.archived else "📂 **Thread Unarchived:**"
             webhook = DiscordWebhook(url=webhook_url, content=f"{status_text} {after.name}", username="Thread Bot")
             webhook.execute()
+
+    async def sync_category(self, category):
+        """Create a mirrored category in the destination server with the same permissions."""
+        destination_guild = discord.utils.get(self.guilds, id=DESTINATION_SERVER_ID)
+        if not destination_guild:
+            print(f"❌ Destination server not found.")
+            return
+
+        # Check if the category already exists
+        existing_category = discord.utils.get(destination_guild.categories, name=category.name)
+        if existing_category:
+            print(f"✅ Category {category.name} already exists in destination.")
+        else:
+            # Copy permissions
+            overwrites = {destination_guild.get_member(role.id): discord.PermissionOverwrite(**vars(perm))
+                          for role, perm in category.overwrites.items()}
+
+            # Create the category in the destination server
+            new_category = await destination_guild.create_category(name=category.name, overwrites=overwrites)
+            print(f"📂 Created category {category.name} in destination.")
+
+            # Sync all channels inside the category
+            for channel in category.channels:
+                await self.sync_channel(channel, new_category)
+
+    async def sync_channel(self, channel, new_category):
+        """Create a mirrored channel in the destination server with the same permissions."""
+        destination_guild = discord.utils.get(self.guilds, id=DESTINATION_SERVER_ID)
+        if not destination_guild:
+            print(f"❌ Destination server not found.")
+            return
+
+        # Check if the channel already exists
+        existing_channel = discord.utils.get(destination_guild.text_channels, name=channel.name)
+        if existing_channel:
+            print(f"✅ Channel {channel.name} already exists in destination.")
+            return
+
+        # Copy permissions
+        overwrites = {destination_guild.get_member(role.id): discord.PermissionOverwrite(**vars(perm))
+                      for role, perm in channel.overwrites.items()}
+
+        # Create the channel inside the new category
+        await destination_guild.create_text_channel(name=channel.name, category=new_category, overwrites=overwrites)
+        print(f"📌 Created channel {channel.name} in destination.")
+
 
 # Function to start multiple bots
 async def start_bots():

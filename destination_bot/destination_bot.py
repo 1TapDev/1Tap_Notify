@@ -1,7 +1,9 @@
 import discord
+import os
+import subprocess
+import time
 from discord.ext import commands
 from discord import app_commands
-import os
 import psycopg2
 from dotenv import load_dotenv
 
@@ -110,6 +112,13 @@ async def sync_categories(interaction: discord.Interaction):
     finally:
         cursor.close()
         conn.close()
+
+@bot.tree.command(name="force_sync", description="Force a full sync of categories & channels",
+                  guild=discord.Object(id=DESTINATION_SERVER_ID))
+async def force_sync(interaction: discord.Interaction):
+    """Manually trigger a full sync of categories and channels."""
+    await sync_categories(interaction)  # Call the sync function
+    await interaction.followup.send("✅ Full sync completed.")
 
 @bot.command()
 async def sync_permissions(ctx):

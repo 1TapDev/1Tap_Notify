@@ -3,11 +3,19 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 import psycopg2
 import datetime
 from psycopg2.extras import DictCursor
 from dotenv import load_dotenv
 from discord_webhook import DiscordWebhook
+
+while True:
+    try:
+        subprocess.run(["python", "bot.py"])
+    except Exception as e:
+        print(f"❌ Self-bot crashed: {e}")
+        time.sleep(5)  # Wait before restarting
 
 # Load environment variables
 load_dotenv()
@@ -125,6 +133,33 @@ class SelfBot(discord.Client):
     async def on_ready(self):
         print(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
         await self.store_server_structure()  # Store categories & channels when the bot starts
+
+    async def on_guild_channel_create(self, channel):
+        """Detect and store new channels in the database."""
+        if channel.guild.id not in self.monitored_servers:
+            return
+
+        conn = connect_db()
+        if conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO channels (category_id, category_name, channel_id, channel_name, server_id) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (channel_id) DO NOTHING;",
+                    (
+                        str(channel.category.id) if channel.category else None,
+                        channel.category.name if channel.category else None,
+                        str(channel.id),
+                        channel.name,
+                        str(channel.guild.id)
+                    )
+                )
+                conn.commit()
+                print(f"📌 New channel detected: {channel.name}")
+            except Exception as e:
+                print(f"❌ Error storing new channel: {e}")
+            finally:
+                cursor.close()
+                conn.close()
 
     async def store_server_structure(self):
         """Fetch and store categories & channels from source servers."""

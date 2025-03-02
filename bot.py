@@ -415,7 +415,6 @@ class SelfBot(discord.Client):
         await destination_guild.create_text_channel(name=channel.name, category=new_category, overwrites=overwrites)
         print(f"📌 Created channel {channel.name} in destination.")
 
-
 # Function to start multiple bots
 async def start_bots():
     bots = []

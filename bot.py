@@ -1,24 +1,35 @@
-import discord
 import asyncio
 import os
+import discord
 import subprocess
 import sys
 import time
 import psycopg2
 import datetime
+import logging
 from psycopg2.extras import DictCursor
 from dotenv import load_dotenv
 from discord_webhook import DiscordWebhook
 
-while True:
-    try:
-        subprocess.run(["python", "bot.py"])
-    except Exception as e:
-        print(f"❌ Self-bot crashed: {e}")
-        time.sleep(5)  # Wait before restarting
-
 # Load environment variables
 load_dotenv()
+
+# Create logs directory if it doesn't exist
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+
+# Setup logging
+logging.basicConfig(
+    filename="logs/bot.log",
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+def log_message(message):
+    """Logs a message to both the console and log file."""
+    print(message)  # Print to console
+    logging.info(message)  # Log to file
 
 # Read multiple tokens from .env
 TOKENS = os.getenv("DISCORD_TOKENS").split(",")
@@ -31,10 +42,7 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 
 DESTINATION_SERVER_ID = int(os.getenv("DESTINATION_SERVER_ID"))
-
-DESTINATION_BOT_PATH = os.path.join(os.getcwd(), "destination_bot", "destination_bot.py")
-VENV_ACTIVATE = os.path.join(os.getcwd(), "destination_bot", ".venv", "Scripts", "activate.bat")  # Windows
-
+    
 # Connect to PostgreSQL
 def connect_db():
     try:
@@ -47,7 +55,7 @@ def connect_db():
         )
         return conn
     except Exception as e:
-        print(f"Database connection error: {e}")
+        log_message(f"Database connection error: {e}")
         return None
 
 # Fetch monitored servers for a specific token
@@ -61,11 +69,11 @@ def get_monitored_servers(token):
         cursor.execute("SELECT server_id FROM servers WHERE token = %s;", (token,))
         servers = [row["server_id"] for row in cursor.fetchall()]
 
-        print(f"✅ Token {token} is assigned to servers: {servers}")  # Debugging Output
+        log_message(f"✅ Token {token} is assigned to servers: {servers}")  # Debugging Output
 
         return servers
     except Exception as e:
-        print(f"Error fetching monitored servers: {e}")
+        log_message(f"Error fetching monitored servers: {e}")
         return []
     finally:
         cursor.close()
@@ -83,7 +91,7 @@ def get_webhook_for_channel(channel_id):
         result = cursor.fetchone()
         return result[0] if result else None
     except Exception as e:
-        print(f"Error fetching webhook: {e}")
+        log_message(f"Error fetching webhook: {e}")
         return None
     finally:
         cursor.close()
@@ -101,38 +109,27 @@ def get_excluded_categories():
         excluded = {row[0] for row in cursor.fetchall()}
         return excluded
     except Exception as e:
-        print(f"Error fetching excluded categories: {e}")
+        log_message(f"Error fetching excluded categories: {e}")
         return set()
     finally:
         cursor.close()
         conn.close()
 
-def start_destination_bot():
-    """Start the destination bot in a separate process."""
-    if not os.path.exists(DESTINATION_BOT_PATH):
-        print("❌ ERROR: destination_bot.py not found!")
-        return
-
-    print("🚀 Starting Destination Bot...")
-
-    if sys.platform == "win32":
-        command = f'cmd /c ""{VENV_ACTIVATE}" && python "{DESTINATION_BOT_PATH}""'
-    else:
-        venv_activate = os.path.join(os.getcwd(), "destination_bot", ".venv", "bin", "activate")
-        command = f'bash -c "source {venv_activate} && python {DESTINATION_BOT_PATH}"'
-
-    subprocess.Popen(command, shell=True)
-
 # SelfBot class
 class SelfBot(discord.Client):
     def __init__(self, token, monitored_servers, **options):
-        super().__init__(**options)  # Remove intents
+        super().__init__(**options)
+        self._connection._use_member_cache = False  # ✅ Prevents scraping errors
         self.token = token
         self.monitored_servers = monitored_servers
 
     async def on_ready(self):
-        print(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
-        await self.store_server_structure()  # Store categories & channels when the bot starts
+        log_message(f"✅ Logged in as {self.user} (ID: {self.user.id}) monitoring servers: {self.monitored_servers}")
+
+    def start_bot(self):
+        """Start the self-bot."""
+        log_message(f"✅ Logging in as a self-bot using token: {self.token[:5]}... (hidden)")
+        self.run(self.token)  # ✅ Correct for discord.py-self
 
     async def on_guild_channel_create(self, channel):
         """Detect and store new channels in the database."""
@@ -154,9 +151,9 @@ class SelfBot(discord.Client):
                     )
                 )
                 conn.commit()
-                print(f"📌 New channel detected: {channel.name}")
+                log_message(f"📌 New channel detected: {channel.name}")
             except Exception as e:
-                print(f"❌ Error storing new channel: {e}")
+                log_message(f"❌ Error storing new channel: {e}")
             finally:
                 cursor.close()
                 conn.close()
@@ -172,7 +169,7 @@ class SelfBot(discord.Client):
             if str(guild.id) not in self.monitored_servers:
                 continue  # Skip unmonitored servers
 
-            print(f"📂 Storing structure for {guild.name} ({guild.id})")
+            log_message(f"📂 Storing structure for {guild.name} ({guild.id})")
 
             # Store categories
             for category in guild.categories:
@@ -180,7 +177,7 @@ class SelfBot(discord.Client):
                     INSERT INTO categories (category_id, category_name, server_id) 
                     VALUES (%s, %s, %s) ON CONFLICT (category_id) DO NOTHING;
                 """, (str(category.id), category.name, str(guild.id)))
-                print(f"✅ Stored category: {category.name}")
+                log_message(f"✅ Stored category: {category.name}")
 
             # Store text channels
             for channel in guild.text_channels:
@@ -194,12 +191,12 @@ class SelfBot(discord.Client):
                     channel.name,
                     str(guild.id)
                 ))
-                print(f"✅ Stored channel: {channel.name}")
+                log_message(f"✅ Stored channel: {channel.name}")
 
         conn.commit()
         cursor.close()
         conn.close()
-        print("✅ Finished storing server structure.")
+        log_message("✅ Finished storing server structure.")
 
     async def on_message(self, message):
         if message.guild and str(message.guild.id) not in self.monitored_servers:
@@ -241,9 +238,9 @@ class SelfBot(discord.Client):
                     )
 
                 conn.commit()
-                print(f"📩 Stored message {message.id} from {message.author} with {len(attachment_data)} attachment(s).")
+                log_message(f"📩 Stored message {message.id} from {message.author} with {len(attachment_data)} attachment(s).")
             except Exception as e:
-                print(f"❌ Error inserting message: {e}")
+                log_message(f"❌ Error inserting message: {e}")
             finally:
                 cursor.close()
                 conn.close()
@@ -272,9 +269,9 @@ class SelfBot(discord.Client):
                     (after.content, datetime.datetime.utcnow(), str(after.id))
                 )
                 conn.commit()
-                print(f"✏️ Edited message {after.id} from {after.author}")
+                log_message(f"✏️ Edited message {after.id} from {after.author}")
             except Exception as e:
-                print(f"❌ Error updating edited message: {e}")
+                log_message(f"❌ Error updating edited message: {e}")
             finally:
                 cursor.close()
                 conn.close()
@@ -300,9 +297,9 @@ class SelfBot(discord.Client):
                     (str(message.id),)
                 )
                 conn.commit()
-                print(f"🗑 Deleted message {message.id} from {message.author}")
+                log_message(f"🗑 Deleted message {message.id} from {message.author}")
             except Exception as e:
-                print(f"❌ Error updating deleted message: {e}")
+                log_message(f"❌ Error updating deleted message: {e}")
             finally:
                 cursor.close()
                 conn.close()
@@ -327,9 +324,9 @@ class SelfBot(discord.Client):
                     (str(thread.id), str(thread.parent.id), thread.name, str(thread.owner_id), thread.created_at)
                 )
                 conn.commit()
-                print(f"🧵 Created thread: {thread.name} in {thread.parent.name}")
+                log_message(f"🧵 Created thread: {thread.name} in {thread.parent.name}")
             except Exception as e:
-                print(f"❌ Error inserting thread: {e}")
+                log_message(f"❌ Error inserting thread: {e}")
             finally:
                 cursor.close()
                 conn.close()
@@ -356,9 +353,9 @@ class SelfBot(discord.Client):
                 )
                 conn.commit()
                 status = "archived" if after.archived else "unarchived"
-                print(f"📂 Thread {after.name} has been {status}.")
+                log_message(f"📂 Thread {after.name} has been {status}.")
             except Exception as e:
-                print(f"❌ Error updating thread: {e}")
+                log_message(f"❌ Error updating thread: {e}")
             finally:
                 cursor.close()
                 conn.close()
@@ -374,13 +371,13 @@ class SelfBot(discord.Client):
         """Create a mirrored category in the destination server with the same permissions."""
         destination_guild = discord.utils.get(self.guilds, id=DESTINATION_SERVER_ID)
         if not destination_guild:
-            print(f"❌ Destination server not found.")
+            log_message(f"❌ Destination server not found.")
             return
 
         # Check if the category already exists
         existing_category = discord.utils.get(destination_guild.categories, name=category.name)
         if existing_category:
-            print(f"✅ Category {category.name} already exists in destination.")
+            log_message(f"✅ Category {category.name} already exists in destination.")
         else:
             # Copy permissions
             overwrites = {destination_guild.get_member(role.id): discord.PermissionOverwrite(**vars(perm))
@@ -388,7 +385,7 @@ class SelfBot(discord.Client):
 
             # Create the category in the destination server
             new_category = await destination_guild.create_category(name=category.name, overwrites=overwrites)
-            print(f"📂 Created category {category.name} in destination.")
+            log_message(f"📂 Created category {category.name} in destination.")
 
             # Sync all channels inside the category
             for channel in category.channels:
@@ -398,13 +395,13 @@ class SelfBot(discord.Client):
         """Create a mirrored channel in the destination server with the same permissions."""
         destination_guild = discord.utils.get(self.guilds, id=DESTINATION_SERVER_ID)
         if not destination_guild:
-            print(f"❌ Destination server not found.")
+            log_message(f"❌ Destination server not found.")
             return
 
         # Check if the channel already exists
         existing_channel = discord.utils.get(destination_guild.text_channels, name=channel.name)
         if existing_channel:
-            print(f"✅ Channel {channel.name} already exists in destination.")
+            log_message(f"✅ Channel {channel.name} already exists in destination.")
             return
 
         # Copy permissions
@@ -413,23 +410,18 @@ class SelfBot(discord.Client):
 
         # Create the channel inside the new category
         await destination_guild.create_text_channel(name=channel.name, category=new_category, overwrites=overwrites)
-        print(f"📌 Created channel {channel.name} in destination.")
+        log_message(f"📌 Created channel {channel.name} in destination.")
 
 # Function to start multiple bots
-async def start_bots():
-    bots = []
+def start_bots():
     for token in TOKENS:
         monitored_servers = get_monitored_servers(token)
         if not monitored_servers:
-            print(f"⚠ No monitored servers for token: {token}")
+            log_message(f"⚠ No monitored servers for token: {token}")
             continue
 
         bot = SelfBot(token, monitored_servers)
-        bots.append(bot)
-        asyncio.create_task(bot.start(token))  # ✅ Corrected, runs inside function
-
-    await asyncio.gather(*[bot.wait_until_ready() for bot in bots])
+        bot.start_bot()  # ✅ Correct for discord-self
 
 if __name__ == "__main__":
-    start_destination_bot()  # 🚀 Start destination bot automatically
-    asyncio.run(start_bots())  # Start self-bot
+    start_bots()  # Start self-bots only

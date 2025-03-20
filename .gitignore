@@ -4,10 +4,9 @@ __pycache__/
 *.db
 *.env
 *.log
+*.json
 .idea/
 venv/
 .venv/
-logs/ 
+logs/
 config.json
-start.bat
-generate_requirements.py

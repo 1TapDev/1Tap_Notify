@@ -63,6 +63,12 @@ async def refresh_webhook_cache():
     except Exception as e:
         print(f"❌ ERROR: Failed to refresh webhook cache: {e}")
 
+async def request_channel_structure(category_name, channel_name):
+    """Request missing category and channel structure from main.py"""
+    request_data = {"category_name": category_name, "channel_name": channel_name}
+    redis_client.lpush("missing_channels", json.dumps(request_data))  # Store request in Redis
+    print(f"🔄 Requested structure for {category_name}/{channel_name} from main.py")
+
 async def create_channel_and_webhook(category_name, channel_name):
     """Ensure the channel exists in the destination server and create a webhook for it."""
     guild = bot.get_guild(DESTINATION_SERVER_ID)
@@ -73,16 +79,23 @@ async def create_channel_and_webhook(category_name, channel_name):
     # Find or create category
     category = discord.utils.get(guild.categories, name=category_name)
     if not category:
-        print(f"➕ Creating category: {category_name}")
-        category = await guild.create_category(category_name)
+        print(f"⚠️ Category '{category_name}' missing. Requesting from main.py...")
+        await request_channel_structure(category_name, channel_name)
+        await asyncio.sleep(2)  # Allow time for main.py to update Redis
+        category = discord.utils.get(guild.categories, name=category_name)
 
     # Find or create channel
-    channel = discord.utils.get(category.channels, name=channel_name)
+    channel = discord.utils.get(category.channels, name=channel_name) if category else None
     if not channel:
-        print(f"➕ Creating channel: {channel_name} under category {category_name}")
-        channel = await guild.create_text_channel(name=channel_name, category=category)
+        print(f"⚠️ Channel '{channel_name}' missing. Waiting for main.py to provide details...")
+        await asyncio.sleep(2)  # Allow time for main.py to update Redis
+        channel = discord.utils.get(category.channels, name=channel_name)
 
-    # Get or create webhook
+    if not category or not channel:
+        print(f"❌ ERROR: Failed to create or retrieve {category_name}/{channel_name}")
+        return None
+
+    # Create webhook
     webhook = await get_or_create_webhook(channel)
     if webhook:
         webhook_key = f"{category_name}/{channel_name}"
@@ -92,6 +105,7 @@ async def create_channel_and_webhook(category_name, channel_name):
         print(f"✅ Webhook created and saved for {category_name}/{channel_name}")
         return webhook.url
     return None
+
 
 
 async def send_to_webhook(message_data):

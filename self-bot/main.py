@@ -146,7 +146,42 @@ async def start_self_bots():
     await asyncio.gather(*clients)
 
 
-# Run self-bots safely
+async def listen_for_missing_channels():
+    """Listen for bot.py requests to provide missing category/channel structure."""
+    while True:
+        request_data = redis_client.rpop("missing_channels")
+        if request_data:
+            request = json.loads(request_data)
+            category_name = request["category_name"]
+            channel_name = request["channel_name"]
+            print(f"📨 Received request for {category_name}/{channel_name}. Fetching details...")
+
+            # Fetch details from monitored servers
+            category_id, channel_id = await fetch_channel_structure(category_name, channel_name)
+
+            if category_id and channel_id:
+                redis_client.hset("channel_structure", f"{category_name}/{channel_name}", json.dumps({
+                    "category_id": category_id,
+                    "channel_id": channel_id
+                }))
+                print(f"✅ Provided structure for {category_name}/{channel_name} to bot.py")
+            else:
+                print(f"⚠️ Could not find {category_name}/{channel_name} in monitored servers.")
+        await asyncio.sleep(2)  # Check every 2 seconds
+
+
+async def fetch_channel_structure(category_name, channel_name):
+    """Find the correct category and channel ID from monitored servers."""
+    for guild in bot.guilds:
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category:
+            channel = discord.utils.get(category.channels, name=channel_name)
+            if channel:
+                return category.id, channel.id
+    return None, None
+
+# Start listening for requests
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
+    loop.create_task(listen_for_missing_channels())  # Start the listener
     loop.run_until_complete(start_self_bots())

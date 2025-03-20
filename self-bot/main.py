@@ -72,14 +72,18 @@ class MirrorSelfBot(discord.Client):
     async def on_message(self, message):
         """Push messages to Redis queue."""
         if not message.guild:
-            return
+            return  # Ignore messages from DMs
 
         server_id = str(message.guild.id)
+
+        # ✅ Only process messages from servers explicitly listed in config.json
+        if server_id not in self.monitored_servers:
+            return  # ❌ Skip processing if the server is not listed
+
         server_name = get_server_info(server_id)
-
         print(f"📢 Processing message from {server_name} (ID: {server_id})")
-        excluded_categories = get_excluded_categories(server_id)
 
+        excluded_categories = get_excluded_categories(server_id)
         if message.channel.category and message.channel.category.id in excluded_categories:
             print(f"❌ Skipping message from {server_name} - Category is excluded")
             return  # ✅ Stop processing this message

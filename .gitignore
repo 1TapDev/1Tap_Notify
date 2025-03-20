@@ -4,7 +4,6 @@ __pycache__/
 *.db
 *.env
 *.log
-*.json
 .idea/
 venv/
 .venv/

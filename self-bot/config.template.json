@@ -1,0 +1,35 @@
+{
+  "tokens": {
+    "YOUR_FIRST_DISCORD_TOKEN": {
+      "servers": {
+        "513487732190740480": {
+          "excluded_categories": [
+            935311559146737765,
+            935311560547663912
+          ]
+        },
+        "908274918573787904": {
+          "excluded_categories": [
+            987654321098765432,
+            987654321055661010
+          ]
+        }
+      }
+    },
+    "YOUR_SECOND_DISCORD_TOKEN": {
+      "servers": {
+        "1345816200864727120": {
+          "excluded_categories": [
+            935311561998872636,
+            935311568273559582
+          ]
+        }
+      }
+    }
+  },
+  "destination_server": 1345816200864727120,
+  "webhooks": {},
+  "settings": {
+    "message_delay": 0.75
+  }
+}

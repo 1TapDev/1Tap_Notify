@@ -1,0 +1,12 @@
+{
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "destination_server": 123456789012345678,
+    "excluded_categories": [
+        111111111111111111,
+        222222222222222222
+    ],
+    "webhooks": {},
+    "settings": {
+        "message_delay": 0.75
+    }
+}

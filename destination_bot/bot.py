@@ -76,37 +76,39 @@ async def create_channel_and_webhook(category_name, channel_name):
         print("❌ ERROR: Destination server not found!")
         return None
 
-    # Find or create category
-    category = discord.utils.get(guild.categories, name=category_name)
-    if not category:
-        print(f"⚠️ Category '{category_name}' missing. Requesting from main.py...")
+    # Wait for main.py to provide structure
+    structure_data = redis_client.hget("channel_structure", f"{category_name}/{channel_name}")
+    if not structure_data:
         await request_channel_structure(category_name, channel_name)
-        await asyncio.sleep(2)  # Allow time for main.py to update Redis
-        category = discord.utils.get(guild.categories, name=category_name)
+        await asyncio.sleep(3)  # Wait for main.py to update Redis
+        structure_data = redis_client.hget("channel_structure", f"{category_name}/{channel_name}")
 
-    # Find or create channel
-    channel = discord.utils.get(category.channels, name=channel_name) if category else None
-    if not channel:
-        print(f"⚠️ Channel '{channel_name}' missing. Waiting for main.py to provide details...")
-        await asyncio.sleep(2)  # Allow time for main.py to update Redis
-        channel = discord.utils.get(category.channels, name=channel_name)
-
-    if not category or not channel:
-        print(f"❌ ERROR: Failed to create or retrieve {category_name}/{channel_name}")
+    if not structure_data:
+        print(f"❌ ERROR: No valid structure data received for {category_name}/{channel_name}")
         return None
 
-    # Create webhook
+    structure = json.loads(structure_data)
+    category_id = structure["category_id"]
+    channel_id = structure["channel_id"]
+
+    # Check if category and channel exist, if not, create them
+    category = discord.utils.get(guild.categories, id=int(category_id))
+    if not category:
+        category = await guild.create_category(category_name)
+
+    channel = discord.utils.get(category.channels, id=int(channel_id))
+    if not channel:
+        channel = await guild.create_text_channel(name=channel_name, category=category)
+
     webhook = await get_or_create_webhook(channel)
     if webhook:
         webhook_key = f"{category_name}/{channel_name}"
         WEBHOOKS[webhook_key] = webhook.url
         redis_client.hset("webhooks", webhook_key, webhook.url)  # Save in Redis
-        save_config()  # Save in config.json
+        save_config()
         print(f"✅ Webhook created and saved for {category_name}/{channel_name}")
         return webhook.url
     return None
-
-
 
 async def send_to_webhook(message_data):
     """Send received message to the appropriate webhook."""

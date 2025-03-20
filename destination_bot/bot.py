@@ -11,12 +11,16 @@ from aiohttp import web
 
 logging.basicConfig(level=logging.ERROR, format="[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-# Load environment variables
-load_dotenv()
-BOT_TOKEN = os.getenv("DESTINATION_BOT_TOKEN")
-
-# Load configuration
+# Load configuration from config.json
 CONFIG_FILE = "config.json"
+
+with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+    config = json.load(f)
+
+BOT_TOKEN = config.get("bot_token")
+
+if not BOT_TOKEN:
+    raise ValueError("❌ ERROR: Bot token is missing from config.json!")
 
 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
     config = json.load(f)

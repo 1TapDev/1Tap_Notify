@@ -36,11 +36,19 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
     config = json.load(f)
 
 TOKENS = config["tokens"]
-DESTINATION_SERVER = config["destination_server"]
+DESTINATION_SERVERS = config.get("destination_servers", {})
 EXCLUDED_CATEGORIES = set(config.get("excluded_categories", []))  # Ensure valid set
 WEBHOOKS = config.get("webhooks", {})
 MESSAGE_DELAY = config["settings"].get("message_delay", 0.75)  # Default to 0.75s delay
 DESTINATION_BOT_URL = "http://127.0.0.1:5000/process_message"  # Change if bot.py is remote
+
+def get_excluded_categories(server_id):
+    """Retrieve excluded categories for a given server."""
+    return set(DESTINATION_SERVERS.get(str(server_id), {}).get("excluded_categories", []))
+
+def get_server_info(server_id):
+    """Retrieve human-readable server name from config.json."""
+    return DESTINATION_SERVERS.get(str(server_id), {}).get("info", "Unknown Server")
 
 def store_message_in_redis(message_data):
     """Store message in Redis only if it matches the destination server"""
@@ -66,24 +74,23 @@ class MirrorSelfBot(discord.Client):
         if not message.guild:
             return
 
-        # ✅ Only process messages from the monitored servers in config.json
-        if str(message.guild.id) not in self.monitored_servers:
-            return
+        server_id = str(message.guild.id)
+        server_name = get_server_info(server_id)
 
-        # ✅ Ignore messages sent by the self-bot to prevent infinite loops
-        if message.author.id == self.user.id:
-            return
+        print(f"📢 Processing message from {server_name} (ID: {server_id})")
+        excluded_categories = get_excluded_categories(server_id)
 
-        # ✅ Exclude messages from categories specified in `config.json`
-        if message.channel.category and message.channel.category.id in EXCLUDED_CATEGORIES:
-            return  # ❌ Skip this message
+        if message.channel.category and message.channel.category.id in excluded_categories:
+            print(f"❌ Skipping message from {server_name} - Category is excluded")
+            return  # ✅ Stop processing this message
 
+        # ✅ Continue processing if not excluded
         message_data = {
             "message_id": str(message.id),
             "channel_id": str(message.channel.id),
             "channel_name": message.channel.name,
             "category_name": message.channel.category.name if message.channel.category else "uncategorized",
-            "server_id": str(message.guild.id),
+            "server_id": server_id,
             "content": message.content,
             "author_id": str(message.author.id),
             "author_name": str(message.author),
@@ -93,7 +100,7 @@ class MirrorSelfBot(discord.Client):
             "embeds": [self.format_embed(embed) for embed in message.embeds],
         }
 
-        # Push message to Redis
+        # ✅ Push message to Redis
         redis_client.lpush("message_queue", json.dumps(message_data))
         log_message(f"📩 Pushed message from {message.author} in #{message.channel.name} to Redis.")
 

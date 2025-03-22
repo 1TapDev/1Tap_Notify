@@ -7,6 +7,8 @@ import logging
 import redis
 from dotenv import load_dotenv
 
+active_bots = []  # Holds active self-bot instances for category monitoring
+
 # Setup logging
 if not os.path.exists("logs"):
     os.makedirs("logs")
@@ -91,11 +93,16 @@ class MirrorSelfBot(discord.Client):
         excluded_categories = get_excluded_categories(server_id)
         excluded_channels = get_excluded_channels(server_id)
 
-        if message.channel.category and message.channel.category.id in excluded_categories:
-            return  # ✅ Stop processing this message
+        # Replace this block inside on_message
+        if message.channel.category:
+            category_id = message.channel.category.id
+            if category_id in excluded_categories:
+                print(f"🚫 Skipping message from excluded category: {category_id}")
+                return
 
         if message.channel.id in excluded_channels:
-            return  # ✅ Stop processing this message
+            print(f"🚫 Skipping message from excluded channel: {message.channel.id}")
+            return
 
         print(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
 
@@ -176,34 +183,11 @@ async def start_self_bots():
         server_ids = set(token_data["servers"].keys())  # Extract server IDs as strings
         print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")  # DEBUG
 
-        bot = MirrorSelfBot(token, server_ids)  # Pass only the server IDs
+        bot = MirrorSelfBot(token, server_ids)
+        active_bots.append(bot)
         clients.append(bot.start(token))
 
     await asyncio.gather(*clients)
-
-
-async def listen_for_missing_channels():
-    """Listen for bot.py requests to provide missing category/channel structure."""
-    while True:
-        request_data = redis_client.rpop("missing_channels")
-        if request_data:
-            request = json.loads(request_data)
-            category_name = request["category_name"]
-            channel_name = request["channel_name"]
-            print(f"📨 Received request for {category_name}/{channel_name}. Fetching details...")
-
-            # Fetch details from monitored servers
-            category_id, channel_id = await fetch_channel_structure(category_name, channel_name)
-
-            if category_id and channel_id:
-                redis_client.hset("channel_structure", f"{category_name}/{channel_name}", json.dumps({
-                    "category_id": category_id,
-                    "channel_id": channel_id
-                }))
-                print(f"✅ Provided structure for {category_name}/{channel_name} to bot.py")
-            else:
-                print(f"⚠️ Could not find {category_name}/{channel_name} in monitored servers.")
-        await asyncio.sleep(2)  # Check every 2 seconds
 
 async def fetch_channel_structure(category_name, channel_name):
     """Find the correct category and channel ID from monitored servers."""
@@ -215,8 +199,63 @@ async def fetch_channel_structure(category_name, channel_name):
                 return category.id, channel.id
     return None, None
 
+async def monitor_category_structure():
+    global previous_structure
+    previous_structure = {}
+    print("📡 Monitoring specified categories for structural changes...")
+
+    monitored = []
+    print("📋 Configured monitored_categories:")
+    for token_data in TOKENS.values():
+        for server_id, server_data in token_data["servers"].items():
+            categories = server_data.get("monitored_categories", [])
+            for category_id in categories:
+                print(f"➡️ Monitoring category: {category_id} from server: {server_id}")
+                monitored.append((str(server_id), int(category_id)))
+
+    while True:
+        for bot in active_bots:
+            for guild in bot.guilds:
+                for server_id, category_id in monitored:
+                    if str(guild.id) != server_id:
+                        continue
+
+                    category = discord.utils.get(guild.categories, id=category_id)
+                    if not category:
+                        continue
+
+                    current_channels = {channel.name: channel.id for channel in category.channels}
+                    key = f"{server_id}/{category_id}"
+
+                    if key not in previous_structure:
+                        previous_structure[key] = current_channels
+                        continue
+
+                    added = {k: v for k, v in current_channels.items() if k not in previous_structure[key]}
+                    removed = {k: v for k, v in previous_structure[key].items() if k not in current_channels}
+
+                    if added or removed:
+                        update_payload = {
+                            "server_id": server_id,
+                            "category_id": category_id,
+                            "category_name": category.name,
+                            "added_channels": added,
+                            "removed_channels": removed
+                        }
+                        redis_client.lpush("category_updates", json.dumps(update_payload))
+                        print(f"📤 Sent category update to Redis: {update_payload}")
+
+                    previous_structure[key] = current_channels
+
+        await asyncio.sleep(2)
+
 # Start listening for requests
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(listen_for_missing_channels())  # Start the listener
-    loop.run_until_complete(start_self_bots())
+    async def main():
+        await start_self_bots()
+        asyncio.create_task(monitor_category_structure())
+
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main())

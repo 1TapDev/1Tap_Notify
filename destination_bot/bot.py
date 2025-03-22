@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 import redis
 import logging
+import hashlib
 from discord.ext import tasks
 from aiohttp import web
 
@@ -18,6 +19,8 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 BOT_TOKEN = config.get("bot_token")
 DESTINATION_SERVER_ID = config["destination_server"]
 WEBHOOKS = config.get("webhooks", {})  # Ensure webhooks key exists
+
+TOKENS = config.get("tokens", {})
 
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
@@ -35,6 +38,42 @@ async def process_redis_messages():
             await send_to_webhook(message)  # ✅ Forward message silently
     except Exception as e:
         logging.error(f"❌ ERROR: Failed to process Redis messages: {e}")
+
+@tasks.loop(seconds=2)
+async def process_category_updates():
+    try:
+        update_data = redis_client.rpop("category_updates")
+        if update_data:
+            data = json.loads(update_data)
+            print(f"🔁 Category update received: {data}")
+
+            guild = bot.get_guild(DESTINATION_SERVER_ID)
+            if not guild:
+                print(f"❌ ERROR: Destination server not found!")
+                return
+
+            # Full category name with server
+            category_name = f"{data['category_name']} [{get_server_info(data['server_id'])}]"
+            category = discord.utils.get(guild.categories, name=category_name)
+            if not category:
+                category = await guild.create_category(category_name)
+                print(f"✅ Created destination category: {category_name}")
+
+            # Remove old channels
+            for chan_name in data.get("removed_channels", {}):
+                chan = discord.utils.get(category.channels, name=chan_name)
+                if chan:
+                    await chan.delete()
+                    print(f"🗑️ Deleted channel: {chan_name}")
+
+            # Create new channels
+            for chan_name in data.get("added_channels", {}):
+                existing = discord.utils.get(category.channels, name=chan_name)
+                if not existing:
+                    await guild.create_text_channel(name=chan_name, category=category)
+                    print(f"📌 Created new channel: {chan_name}")
+    except Exception as e:
+        print(f"❌ ERROR in process_category_updates: {e}")
 
 async def refresh_webhook_cache():
     """Refresh webhook mappings from Redis or config file."""
@@ -107,12 +146,15 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
 
     return None
 
+def generate_message_hash(message_data):
+    """Generate SHA256 hash for a message."""
+    raw = f"{message_data['message_id']}:{message_data['content']}:{message_data['author_id']}:{message_data['timestamp']}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 async def send_to_webhook(message_data):
     """Send received message to the appropriate webhook."""
     category_name = message_data.get("category_name", "uncategorized").strip().lower()
     channel_name = message_data["channel_name"].strip().lower()
-
     server_name = message_data.get("server_name", f"Unknown Server ({message_data.get('server_id', '000000')})")
 
     category_name = category_name.replace(" ", "-").replace("|", "").strip()
@@ -128,6 +170,15 @@ async def send_to_webhook(message_data):
     if not webhook_url:
         logging.error(f"❌ ERROR: Still no webhook found for '{webhook_key}' after creation.")
         return
+
+    # Deduplication step ✅
+    msg_hash = generate_message_hash(message_data)
+    if redis_client.sismember("recent_messages", msg_hash):
+        print("🔁 Duplicate message detected, skipping.")
+        return
+    else:
+        redis_client.sadd("recent_messages", msg_hash)
+        redis_client.expire("recent_messages", 14400)  # Optional: 4-hour expiry
 
     embeds = message_data.get("embeds", [])
 
@@ -166,6 +217,52 @@ async def send_to_webhook(message_data):
                 error_text = await response.text()
                 logging.error(f"⚠️ Failed to send message to webhook ({response.status}) → {error_text}")
 
+async def monitor_category_structure():
+    print("📡 Starting category structure monitor...")
+    global previous_structure
+
+    monitored_categories = config.get("monitored_categories", [])
+
+    while True:
+        for item in monitored_categories:
+            server_id = str(item["server_id"])
+            category_id = int(item["category_id"])
+
+            for guild in bot.guilds:
+                if str(guild.id) != server_id:
+                    continue
+
+                category = discord.utils.get(guild.categories, id=category_id)
+                if not category:
+                    continue
+
+                current_channels = {channel.name: channel.id for channel in category.channels}
+                key = f"{server_id}/{category_id}"
+
+                if key not in previous_structure:
+                    previous_structure[key] = current_channels
+                    continue
+
+                # Detect new or deleted channels
+                added = {k: v for k, v in current_channels.items() if k not in previous_structure[key]}
+                removed = {k: v for k, v in previous_structure[key].items() if k not in current_channels}
+
+                if added or removed:
+                    update_payload = {
+                        "server_id": server_id,
+                        "category_id": category_id,
+                        "category_name": category.name,
+                        "added_channels": added,
+                        "removed_channels": removed
+                    }
+                    redis_client.lpush("category_updates", json.dumps(update_payload))
+                    print(f"🔁 Detected category update: {update_payload}")
+
+                previous_structure[key] = current_channels
+
+        await asyncio.sleep(2)  # ✅ Repeat every 2 seconds
+
+
 class DestinationBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -175,6 +272,7 @@ class DestinationBot(discord.Client):
     async def on_ready(self):
         print(f"✅ Bot {self.user} is running!")
         print("🔍 Checking available servers...")
+        process_category_updates.start()
 
         # Load webhooks from Redis after the bot is ready
         self.webhook_cache = redis_client.hgetall("webhooks")
@@ -192,8 +290,10 @@ class DestinationBot(discord.Client):
         else:
             print(f"❌ ERROR: Destination server (ID: {DESTINATION_SERVER_ID}) not found!")
 
-        # ✅ Start processing Redis messages here
         process_redis_messages.start()
+
+        # ✅ START THE CATEGORY MONITOR HERE
+        asyncio.create_task(monitor_category_structure())
 
     async def ensure_webhooks(self):
         """Ensure webhooks exist for all channels in the destination server."""
@@ -294,8 +394,10 @@ async def start_web_server():
 
 async def run_bot():
     global bot
+    global previous_structure
+    previous_structure = {}
+
     bot = DestinationBot(intents=discord.Intents.default())
-    # Load existing webhooks into cache
     bot.webhook_cache = redis_client.hgetall("webhooks")
 
     # Run bot and web server concurrently

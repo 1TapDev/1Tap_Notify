@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 if not os.path.exists("logs"):
     os.makedirs("logs")
 
+# Log everything to file
 logging.basicConfig(
     filename="logs/bot.log",
     level=logging.INFO,
@@ -20,10 +21,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
+# Only show ERROR and above in the console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.ERROR)
+console_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+console_handler.setFormatter(console_formatter)
+logging.getLogger().addHandler(console_handler)
+
 def log_message(message):
-    """Logs a message to both the console and log file."""
-    print(message)
-    logging.info(message)
+    logging.info(message)  # No print
 
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0)
@@ -68,12 +74,12 @@ class MirrorSelfBot(discord.Client):
     def __init__(self, token, monitored_servers):
         super().__init__()
         self.token = token
-        self.monitored_servers = {str(server_id) for server_id in monitored_servers}  # ✅ Ensure set of strings
+        self.monitored_servers = {str(server_id) for server_id in monitored_servers}
+        self.session = aiohttp.ClientSession()  # ✅ Initialize session here
 
     async def on_ready(self):
         await self.fetch_guilds()
-        self.session = aiohttp.ClientSession()
-        print(f"✅ Self-bot {self.user} is now monitoring servers: {self.monitored_servers}")  # ✅ DEBUG OUTPUT
+        print(f"✅ Self-bot {self.user} is now monitoring servers: {self.monitored_servers}")
 
     async def on_message(self, message):
         """Process messages and ensure they belong to monitored servers."""
@@ -102,7 +108,7 @@ class MirrorSelfBot(discord.Client):
         if message.channel.id in excluded_channels:
             return
 
-        print(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
+        logging.info(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
 
         message_data = {
             "message_id": str(message.id),
@@ -120,8 +126,6 @@ class MirrorSelfBot(discord.Client):
             "embeds": [self.format_embed(embed) for embed in message.embeds],
         }
 
-        # ✅ Push message to Redis
-        print(f"✅ DEBUG: Pushing message to Redis → Server Name: {server_name}, Server ID: {server_id}")
         try:
             redis_client.lpush("message_queue", json.dumps(message_data))
             log_message(f"📩 Pushed message from {message.author} in #{message.channel.name} to Redis.")
@@ -155,8 +159,6 @@ class MirrorSelfBot(discord.Client):
             try:
                 async with self.session.post(DESTINATION_BOT_URL, json=message_data) as response:
                     response_text = await response.text()
-                    print(f"📨 Sent message to bot.py | Status: {response.status} | Response: {response_text}")
-
                     if response.status == 200:
                         return
                     else:

@@ -8,20 +8,24 @@ import redis
 import hashlib
 import traceback
 from dotenv import load_dotenv
+from datetime import datetime
 
-# Setup logging
+# Setup logging directory
 if not os.path.exists("logs"):
     os.makedirs("logs")
 
-# Log everything to file
+# Generate log filename with date and time
+log_filename = datetime.now().strftime("logs/main_%Y-%m-%d_%H-%M-%S.log")
+
+# Configure logging
 logging.basicConfig(
-    filename="logs/bot.log",
+    filename=log_filename,
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Only show ERROR and above in the console
+# Configure console to only show errors
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.ERROR)
 console_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")

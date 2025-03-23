@@ -212,15 +212,20 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
             return webhook.url
         return None
 
-    # If not found, fallback to creating the category/channel
-    full_category_name = f"{category_name} [{server_name}]"
-    category = discord.utils.get(guild.categories, name=full_category_name)
+    # ✅ FIX: Match any existing category that closely matches the intended category name
+    category = None
+    for cat in guild.categories:
+        cat_normalized = cat.name.lower().replace(" ", "-").replace("|", "").replace("︱", "")
+        if category_name in cat_normalized:
+            category = cat
+            break
 
     template_category = discord.utils.get(guild.categories, name="INFORMATION [AK CHEFS]")
     overwrites = template_category.overwrites if template_category else {}
 
     if not category:
         try:
+            full_category_name = f"{category_name} [{server_name}]"
             category = await guild.create_category(full_category_name, overwrites=overwrites)
             print(f"✅ Created category: {full_category_name}")
         except Exception as e:

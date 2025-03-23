@@ -81,7 +81,7 @@ async def send_to_webhook(message_data):
 
     cleaned_embeds = []
 
-    # Convert normal embed content
+    # Handle standard embeds
     for embed in embeds:
         if not embed:
             continue
@@ -101,14 +101,14 @@ async def send_to_webhook(message_data):
         }
         cleaned_embeds.append(cleaned_embed)
 
-    # If no embeds but attachments exist, treat the first attachment as an image
+    # If no embeds and we have attachments, create a fallback image embed
     if not cleaned_embeds and attachments:
-        first_attachment_url = attachments[0]
         cleaned_embeds.append({
             "title": None,
             "description": "",
-            "image": {"url": first_attachment_url}
+            "image": {"url": attachments[0]}
         })
+
     cleaned_embeds = []
     for embed in embeds:
         if not embed:

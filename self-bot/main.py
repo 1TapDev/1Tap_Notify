@@ -5,9 +5,9 @@ import aiohttp
 import asyncio
 import logging
 import redis
+import hashlib
+import traceback
 from dotenv import load_dotenv
-
-active_bots = []  # Holds active self-bot instances for category monitoring
 
 # Setup logging
 if not os.path.exists("logs"):
@@ -54,8 +54,11 @@ def get_excluded_categories(server_id):
     return set()  # Return an empty set if no excluded categories are found
 
 def get_excluded_channels(server_id):
-    """Retrieve excluded channels for a given server."""
-    return set(TOKENS.get(str(server_id), {}).get("excluded_channels", []))
+    """Retrieve excluded channels for a given server from TOKENS data."""
+    for token_data in TOKENS.values():
+        if "servers" in token_data and server_id in token_data["servers"]:
+            return set(token_data["servers"][server_id].get("excluded_channels", []))
+    return set()
 
 def get_server_info(server_id):
     """Retrieve human-readable server name from config.json."""
@@ -83,9 +86,6 @@ class MirrorSelfBot(discord.Client):
         # Fetch the correct server name
         server_name = server.name if server else f"Unknown Server ({server_id})"
 
-        # Debugging print to check if the correct server name is retrieved
-        print(f"📌 Server Debug: {server_name} (ID: {server_id})")
-
         # ✅ Only process messages from servers explicitly listed in config.json
         if server_id not in self.monitored_servers:
             return  # ❌ Skip processing if the server is not listed
@@ -97,11 +97,9 @@ class MirrorSelfBot(discord.Client):
         if message.channel.category:
             category_id = message.channel.category.id
             if category_id in excluded_categories:
-                print(f"🚫 Skipping message from excluded category: {category_id}")
                 return
 
         if message.channel.id in excluded_channels:
-            print(f"🚫 Skipping message from excluded channel: {message.channel.id}")
             return
 
         print(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
@@ -127,7 +125,6 @@ class MirrorSelfBot(discord.Client):
         try:
             redis_client.lpush("message_queue", json.dumps(message_data))
             log_message(f"📩 Pushed message from {message.author} in #{message.channel.name} to Redis.")
-            print(f"✅ DEBUG: Message successfully pushed to Redis: {message_data}")  # DEBUG
         except Exception as e:
             print(f"❌ ERROR: Failed to push message to Redis: {e}")
 
@@ -156,14 +153,11 @@ class MirrorSelfBot(discord.Client):
 
         for attempt in range(retries):
             try:
-                print(f"✅ DEBUG: Sending message to bot.py → {message_data}")
-                print(f"🚀 Attempt {attempt + 1}: Sending to bot.py → {DESTINATION_BOT_URL}")
                 async with self.session.post(DESTINATION_BOT_URL, json=message_data) as response:
                     response_text = await response.text()
                     print(f"📨 Sent message to bot.py | Status: {response.status} | Response: {response_text}")
 
                     if response.status == 200:
-                        print(f"✅ Successfully sent message: {message_data}")
                         return
                     else:
                         print(f"❌ ERROR: Failed to send message ({response.status}) - {response_text}")
@@ -175,86 +169,28 @@ class MirrorSelfBot(discord.Client):
         if self.session:
             await self.session.close()  # Ensure session is properly closed
 
-# Run multiple self-bots
 async def start_self_bots():
-    clients = []
-
-    for token, token_data in TOKENS.items():  # token_data contains "servers"
-        server_ids = set(token_data["servers"].keys())  # Extract server IDs as strings
-        print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")  # DEBUG
+    for token, token_data in TOKENS.items():
+        server_ids = set(token_data["servers"].keys())
+        print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
 
         bot = MirrorSelfBot(token, server_ids)
-        active_bots.append(bot)
-        clients.append(bot.start(token))
 
-    await asyncio.gather(*clients)
-
-async def fetch_channel_structure(category_name, channel_name):
-    """Find the correct category and channel ID from monitored servers."""
-    for guild in bot.guilds:
-        category = discord.utils.get(guild.categories, name=category_name)
-        if category:
-            channel = discord.utils.get(category.channels, name=channel_name)
-            if channel:
-                return category.id, channel.id
-    return None, None
-
-async def monitor_category_structure():
-    global previous_structure
-    previous_structure = {}
-    print("📡 Monitoring specified categories for structural changes...")
-
-    monitored = []
-    print("📋 Configured monitored_categories:")
-    for token_data in TOKENS.values():
-        for server_id, server_data in token_data["servers"].items():
-            categories = server_data.get("monitored_categories", [])
-            for category_id in categories:
-                print(f"➡️ Monitoring category: {category_id} from server: {server_id}")
-                monitored.append((str(server_id), int(category_id)))
-
-    while True:
-        for bot in active_bots:
-            for guild in bot.guilds:
-                for server_id, category_id in monitored:
-                    if str(guild.id) != server_id:
-                        continue
-
-                    category = discord.utils.get(guild.categories, id=category_id)
-                    if not category:
-                        continue
-
-                    current_channels = {channel.name: channel.id for channel in category.channels}
-                    key = f"{server_id}/{category_id}"
-
-                    if key not in previous_structure:
-                        previous_structure[key] = current_channels
-                        continue
-
-                    added = {k: v for k, v in current_channels.items() if k not in previous_structure[key]}
-                    removed = {k: v for k, v in previous_structure[key].items() if k not in current_channels}
-
-                    if added or removed:
-                        update_payload = {
-                            "server_id": server_id,
-                            "category_id": category_id,
-                            "category_name": category.name,
-                            "added_channels": added,
-                            "removed_channels": removed
-                        }
-                        redis_client.lpush("category_updates", json.dumps(update_payload))
-                        print(f"📤 Sent category update to Redis: {update_payload}")
-
-                    previous_structure[key] = current_channels
-
-        await asyncio.sleep(2)
+        # Create the task (don't await it here!)
+        asyncio.create_task(bot.start(token))
 
 # Start listening for requests
 if __name__ == "__main__":
     async def main():
         await start_self_bots()
-        asyncio.create_task(monitor_category_structure())
 
+        # Give bots a second to login
+        print("⏳ Waiting for self-bots to finish login...")
+        await asyncio.sleep(5)
+
+        # Prevent script from exiting
+        while True:
+            await asyncio.sleep(3600)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

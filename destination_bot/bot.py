@@ -5,10 +5,32 @@ import aiohttp
 import redis
 import logging
 import hashlib
+import os
 from discord.ext import tasks
 from aiohttp import web
+from datetime import datetime
 
-logging.basicConfig(level=logging.ERROR, format="[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+# Setup logging directory
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+
+# Generate log filename with date and time
+log_filename = datetime.now().strftime("logs/bot_%Y-%m-%d_%H-%M-%S.log")
+
+# Configure logging
+logging.basicConfig(
+    filename=log_filename,
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Configure console to only show errors
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.ERROR)
+console_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+console_handler.setFormatter(console_formatter)
+logging.getLogger().addHandler(console_handler)
 
 # Load configuration from config.json
 CONFIG_FILE = "config.json"
@@ -51,7 +73,7 @@ async def process_redis_messages():
 async def send_to_webhook(message_data):
     message_id = message_data.get("message_id")
     if message_id in recent_message_ids:
-        print(f"🔁 Skipping duplicate message ID: {message_id}")
+        logging.info(f"🔁 Skipping duplicate message ID: {message_id}")
         return
     recent_message_ids.add(message_id)
 
@@ -157,7 +179,7 @@ class DestinationBot(discord.Client):
     async def ensure_webhooks(self):
         guild = self.get_guild(DESTINATION_SERVER_ID)
         if not guild:
-            print("❌ ERROR: Destination server not found!")
+            logging.error("❌ ERROR: Destination server not found!")
             return
 
         server_name = guild.name
@@ -176,7 +198,7 @@ class DestinationBot(discord.Client):
                 WEBHOOKS[webhook_key] = webhook_url
                 redis_client.hset("webhooks", webhook_key, webhook_url)
                 self.save_config()
-                print(f"✅ Created webhook for {category_name}/{channel_name}")
+                logging.info(f"✅ Created webhook for {category_name}/{channel_name}")
 
     async def get_or_create_webhook(self, channel, server_name):
         try:
@@ -186,7 +208,7 @@ class DestinationBot(discord.Client):
             await asyncio.sleep(1.5)
             return await channel.create_webhook(name="1Tap Notify")
         except Exception as e:
-            print(f"❌ ERROR: Failed to create webhook in {channel.name}: {e}")
+            logging.error(f"❌ ERROR: Failed to create webhook in {channel.name}: {e}")
             return None
 
     def save_config(self):
@@ -202,7 +224,7 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
     # First, check if the channel already exists anywhere in the server
     existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
     if existing_channel:
-        print(f"📦 Found existing channel: {channel_name} (ID: {existing_channel.id})")
+        logging.info(f"📦 Found existing channel: {channel_name} (ID: {existing_channel.id})")
         webhook = await bot.get_or_create_webhook(existing_channel, server_name)
         if webhook:
             webhook_key = normalize_key(category_name, channel_name, server_name)
@@ -227,16 +249,16 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
         try:
             full_category_name = f"{category_name} [{server_name}]"
             category = await guild.create_category(full_category_name, overwrites=overwrites)
-            print(f"✅ Created category: {full_category_name}")
+            logging.info(f"✅ Created category: {full_category_name}")
         except Exception as e:
-            print(f"❌ Failed to create category '{full_category_name}': {e}")
+            logging.error(f"❌ Failed to create category '{full_category_name}': {e}")
             return None
 
     try:
         channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
-        print(f"✅ Created channel: {channel_name}")
+        logging.info(f"✅ Created channel: {channel_name}")
     except Exception as e:
-        print(f"❌ Failed to create channel '{channel_name}': {e}")
+        logging.error(f"❌ Failed to create channel '{channel_name}': {e}")
         return None
 
     webhook = await bot.get_or_create_webhook(channel, server_name)
@@ -253,11 +275,11 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
 async def process_message(request):
     try:
         message_data = await request.json()
-        print(f"📩 Received message: {message_data}")
+        logging.info(f"📩 Received message: {message_data}")
         redis_client.lpush("message_queue", json.dumps(message_data))
         return web.json_response({"status": "success", "message": "Message received"}, status=200)
     except Exception as e:
-        print(f"❌ ERROR: Failed to process message: {e}")
+        logging.error(f"❌ ERROR: Failed to process message: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def start_web_server():

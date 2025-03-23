@@ -18,8 +18,7 @@ with open(CONFIG_FILE, "r", encoding="utf-8") as f:
 
 BOT_TOKEN = config.get("bot_token")
 DESTINATION_SERVER_ID = config["destination_server"]
-WEBHOOKS = config.get("webhooks", {})  # Ensure webhooks key exists
-
+WEBHOOKS = config.get("webhooks", {})
 TOKENS = config.get("tokens", {})
 
 # Connect to Redis
@@ -27,241 +26,119 @@ redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=T
 
 # Initialize bot
 intents = discord.Intents.default()
-intents.guilds = True  # ✅ Ensure guilds intent is enabled
+intents.guilds = True
 
-@tasks.loop(seconds=2)  # Poll Redis every 2 seconds
+# Global cache to track recent message_ids and prevent duplicates
+recent_message_ids = set()
+
+def normalize_key(category_name, channel_name, server_name):
+    norm_category = category_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").replace("⚡", "").strip()
+    norm_channel = channel_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").strip()
+    norm_server = server_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").strip()
+    return f"{norm_category}-[{norm_server}]/{norm_channel}"
+
 async def process_redis_messages():
     try:
-        message_data = redis_client.rpop("message_queue")
-        if message_data:
-            message = json.loads(message_data)
-            await send_to_webhook(message)  # ✅ Forward message silently
+        while True:
+            message_data = redis_client.rpop("message_queue")
+            if message_data:
+                message = json.loads(message_data)
+                await send_to_webhook(message)
+            await asyncio.sleep(2)
     except Exception as e:
         logging.error(f"❌ ERROR: Failed to process Redis messages: {e}")
 
-@tasks.loop(seconds=2)
-async def process_category_updates():
-    try:
-        update_data = redis_client.rpop("category_updates")
-        if update_data:
-            data = json.loads(update_data)
-            print(f"🔁 Category update received: {data}")
-
-            guild = bot.get_guild(DESTINATION_SERVER_ID)
-            if not guild:
-                print(f"❌ ERROR: Destination server not found!")
-                return
-
-            # Full category name with server
-            category_name = f"{data['category_name']} [{get_server_info(data['server_id'])}]"
-            category = discord.utils.get(guild.categories, name=category_name)
-            if not category:
-                category = await guild.create_category(category_name)
-                print(f"✅ Created destination category: {category_name}")
-
-            # Remove old channels
-            for chan_name in data.get("removed_channels", {}):
-                chan = discord.utils.get(category.channels, name=chan_name)
-                if chan:
-                    await chan.delete()
-                    print(f"🗑️ Deleted channel: {chan_name}")
-
-            # Create new channels
-            for chan_name in data.get("added_channels", {}):
-                existing = discord.utils.get(category.channels, name=chan_name)
-                if not existing:
-                    await guild.create_text_channel(name=chan_name, category=category)
-                    print(f"📌 Created new channel: {chan_name}")
-    except Exception as e:
-        print(f"❌ ERROR in process_category_updates: {e}")
-
-async def refresh_webhook_cache():
-    """Refresh webhook mappings from Redis or config file."""
-    global WEBHOOKS
-    print("🔄 Refreshing webhook cache...")
-
-    # Fetch updated webhooks from Redis
-    try:
-        updated_webhooks = redis_client.hgetall("webhooks")  # Ensure this key exists in Redis
-        if updated_webhooks:
-            WEBHOOKS = updated_webhooks
-            print("✅ Webhook cache updated from Redis.")
-        else:
-            print("⚠️ No webhooks found in Redis. Check if they were stored properly.")
-    except Exception as e:
-        print(f"❌ ERROR: Failed to refresh webhook cache: {e}")
-
-async def create_channel_and_webhook(category_name, channel_name, server_name):
-    """Ensure the category and channel exist before creating a webhook."""
-    full_category_name = f"{category_name} [{server_name}]"
-
-    guild = bot.get_guild(DESTINATION_SERVER_ID)
-    if not guild:
-        print(f"❌ ERROR: Destination server (ID: {DESTINATION_SERVER_ID}) not found!")
-        return None
-
-    print(f"🔍 Checking category '{full_category_name}' in {guild.name}...")
-
-    # 🔁 Copy permissions from a template category
-    template_category = discord.utils.get(guild.categories, name="INFORMATION [AK CHEFS]")
-    overwrites = template_category.overwrites if template_category else {}
-
-    category = discord.utils.get(guild.categories, name=full_category_name)
-    if not category:
-        try:
-            category = await guild.create_category(full_category_name, overwrites=overwrites)
-            print(f"✅ Created category: {full_category_name} (ID: {category.id})")
-        except discord.Forbidden:
-            print(f"❌ ERROR: Bot lacks permission to create category '{full_category_name}'!")
-            return None
-        except Exception as e:
-            print(f"❌ ERROR: Failed to create category '{full_category_name}': {e}")
-            return None
-
-    print(f"🔍 Checking channel '{channel_name}' in category '{category.name}'...")
-
-    channel = discord.utils.get(category.channels, name=channel_name)
-    if not channel:
-        try:
-            # Use the same overwrites for the channel
-            channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
-            print(f"✅ Created channel: {channel_name} (ID: {channel.id})")
-        except discord.Forbidden:
-            print(f"❌ ERROR: Bot lacks permission to create channel '{channel_name}'!")
-            return None
-        except Exception as e:
-            print(f"❌ ERROR: Failed to create channel '{channel_name}': {e}")
-            return None
-
-    print(f"🔍 Creating webhook for '{channel_name}'...")
-
-    webhook = await bot.get_or_create_webhook(channel)
-    if webhook:
-        webhook_key = f"{category_name}/{channel_name}"
-        WEBHOOKS[webhook_key] = webhook.url
-        redis_client.hset("webhooks", webhook_key, webhook.url)
-        bot.save_config()
-        print(f"✅ Webhook created and saved for '{webhook_key}'")
-        return webhook.url
-
-    return None
-
-def generate_message_hash(message_data):
-    """Generate SHA256 hash for a message."""
-    raw = f"{message_data['message_id']}:{message_data['content']}:{message_data['author_id']}:{message_data['timestamp']}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
 async def send_to_webhook(message_data):
-    """Send received message to the appropriate webhook."""
-    category_name = message_data.get("category_name", "uncategorized").strip().lower()
-    channel_name = message_data["channel_name"].strip().lower()
-    server_name = message_data.get("server_name", f"Unknown Server ({message_data.get('server_id', '000000')})")
+    message_id = message_data.get("message_id")
+    if message_id in recent_message_ids:
+        print(f"🔁 Skipping duplicate message ID: {message_id}")
+        return
+    recent_message_ids.add(message_id)
 
-    category_name = category_name.replace(" ", "-").replace("|", "").strip()
-    channel_name = channel_name.replace(" ", "-").replace("|", "").strip()
+    # Trim cache size (avoid memory bloat)
+    if len(recent_message_ids) > 1000:
+        recent_message_ids.pop()
 
-    webhook_key = f"{category_name}/{channel_name}"
+    raw_cat = message_data.get("category_name", "uncategorized").strip()
+    raw_srv = message_data.get("server_name", "Unknown Server").strip()
+    raw_chan = message_data["channel_name"].strip()
+
+    category_name = raw_cat.lower().replace(" ", "-").replace("|", "")
+    server_name = raw_srv.lower().replace(" ", "-").replace("|", "")
+    channel_name = raw_chan.lower().replace(" ", "-").replace("|", "")
+
+    webhook_key = f"{category_name}-[{server_name}]/{channel_name}"
     webhook_url = WEBHOOKS.get(webhook_key)
 
     if not webhook_url:
-        logging.error(f"❌ ERROR: No matching webhook found for '{webhook_key}'. Creating channel & webhook...")
+        # Rebuild category/channel if needed
         webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
-
-    if not webhook_url:
-        logging.error(f"❌ ERROR: Still no webhook found for '{webhook_key}' after creation.")
-        return
-
-    # Deduplication step ✅
-    msg_hash = generate_message_hash(message_data)
-    if redis_client.sismember("recent_messages", msg_hash):
-        print("🔁 Duplicate message detected, skipping.")
-        return
-    else:
-        redis_client.sadd("recent_messages", msg_hash)
-        redis_client.expire("recent_messages", 14400)  # Optional: 4-hour expiry
+        if not webhook_url:
+            return
 
     embeds = message_data.get("embeds", [])
+    attachments = message_data.get("attachments", [])
 
     cleaned_embeds = []
+
+    # Convert normal embed content
     for embed in embeds:
         if not embed:
             continue
-
         cleaned_embed = {
             "title": embed.get("title") or "Untitled",
             "description": embed.get("description") or "",
-            "url": embed.get("url") or None,
+            "url": embed.get("url"),
             "color": embed.get("color", 0x000000),
             "fields": [
-                {"name": field["name"], "value": field["value"]}
-                for field in embed.get("fields", []) if "name" in field and "value" in field
+                {"name": f["name"], "value": f["value"]}
+                for f in embed.get("fields", []) if "name" in f and "value" in f
             ],
             "thumbnail": {"url": embed["thumbnail"]} if embed.get("thumbnail") else None,
             "image": {"url": embed["image"]} if embed.get("image") else None,
             "footer": {"text": embed["footer"]} if embed.get("footer") else None,
             "author": {"name": embed["author"]} if embed.get("author") else None
         }
+        cleaned_embeds.append(cleaned_embed)
 
+    # If no embeds but attachments exist, treat the first attachment as an image
+    if not cleaned_embeds and attachments:
+        first_attachment_url = attachments[0]
+        cleaned_embeds.append({
+            "title": None,
+            "description": "",
+            "image": {"url": first_attachment_url}
+        })
+    cleaned_embeds = []
+    for embed in embeds:
+        if not embed:
+            continue
+        cleaned_embed = {
+            "title": embed.get("title") or "Untitled",
+            "description": embed.get("description") or "",
+            "url": embed.get("url"),
+            "color": embed.get("color", 0x000000),
+            "fields": [
+                {"name": f["name"], "value": f["value"]}
+                for f in embed.get("fields", []) if "name" in f and "value" in f
+            ],
+            "thumbnail": {"url": embed["thumbnail"]} if embed.get("thumbnail") else None,
+            "image": {"url": embed["image"]} if embed.get("image") else None,
+            "footer": {"text": embed["footer"]} if embed.get("footer") else None,
+            "author": {"name": embed["author"]} if embed.get("author") else None
+        }
         cleaned_embeds.append(cleaned_embed)
 
     async with aiohttp.ClientSession() as session:
         async with session.post(webhook_url, json={
             "content": message_data.get("content", ""),
             "username": message_data.get("author_name", "Unknown"),
-            "avatar_url": message_data.get("author_avatar", None),
+            "avatar_url": message_data.get("author_avatar"),
             "embeds": cleaned_embeds
         }) as response:
-            if response.status == 204:
-                return
-            if response.status != 200:
+            if response.status != 204 and response.status != 200:
                 error_text = await response.text()
                 logging.error(f"⚠️ Failed to send message to webhook ({response.status}) → {error_text}")
-
-async def monitor_category_structure():
-    print("📡 Starting category structure monitor...")
-    global previous_structure
-
-    monitored_categories = config.get("monitored_categories", [])
-
-    while True:
-        for item in monitored_categories:
-            server_id = str(item["server_id"])
-            category_id = int(item["category_id"])
-
-            for guild in bot.guilds:
-                if str(guild.id) != server_id:
-                    continue
-
-                category = discord.utils.get(guild.categories, id=category_id)
-                if not category:
-                    continue
-
-                current_channels = {channel.name: channel.id for channel in category.channels}
-                key = f"{server_id}/{category_id}"
-
-                if key not in previous_structure:
-                    previous_structure[key] = current_channels
-                    continue
-
-                # Detect new or deleted channels
-                added = {k: v for k, v in current_channels.items() if k not in previous_structure[key]}
-                removed = {k: v for k, v in previous_structure[key].items() if k not in current_channels}
-
-                if added or removed:
-                    update_payload = {
-                        "server_id": server_id,
-                        "category_id": category_id,
-                        "category_name": category.name,
-                        "added_channels": added,
-                        "removed_channels": removed
-                    }
-                    redis_client.lpush("category_updates", json.dumps(update_payload))
-                    print(f"🔁 Detected category update: {update_payload}")
-
-                previous_structure[key] = current_channels
-
-        await asyncio.sleep(2)  # ✅ Repeat every 2 seconds
-
 
 class DestinationBot(discord.Client):
     def __init__(self, *args, **kwargs):
@@ -271,111 +148,107 @@ class DestinationBot(discord.Client):
 
     async def on_ready(self):
         print(f"✅ Bot {self.user} is running!")
-        print("🔍 Checking available servers...")
-        process_category_updates.start()
-
-        # Load webhooks from Redis after the bot is ready
         self.webhook_cache = redis_client.hgetall("webhooks")
-
         await self.ensure_webhooks()
         self.save_config()
         print("✅ Webhook setup complete. Bot is now processing messages.")
-
-        for guild in self.guilds:
-            print(f"➡️ {guild.name} (ID: {guild.id})")
-
-        guild = self.get_guild(DESTINATION_SERVER_ID)
-        if guild:
-            print(f"✅ Connected to destination server: {guild.name} (ID: {DESTINATION_SERVER_ID})")
-        else:
-            print(f"❌ ERROR: Destination server (ID: {DESTINATION_SERVER_ID}) not found!")
-
-        process_redis_messages.start()
-
-        # ✅ START THE CATEGORY MONITOR HERE
-        asyncio.create_task(monitor_category_structure())
+        asyncio.create_task(process_redis_messages())
 
     async def ensure_webhooks(self):
-        """Ensure webhooks exist for all channels in the destination server."""
         guild = self.get_guild(DESTINATION_SERVER_ID)
         if not guild:
             print("❌ ERROR: Destination server not found!")
             return
 
-        for channel in guild.text_channels:
-            # ✅ Normalize category and channel names for matching
-            category_name = channel.category.name.lower().replace(" ", "-").replace("|", "").replace("│", "").replace(
-                "︱", "").replace("⚡", "").strip() if channel.category else "uncategorized"
-            channel_name = channel.name.lower().replace(" ", "-").replace("|", "").replace("│", "").replace("︱",
-                                                                                                            "").strip()
+        server_name = guild.name
 
-            webhook_key = f"{category_name}/{channel_name}"
+        for channel in guild.text_channels:
+            category_name = channel.category.name.lower().replace(" ", "-").replace("|", "") if channel.category else "uncategorized"
+            channel_name = channel.name.lower().replace(" ", "-").replace("|", "")
+            webhook_key = normalize_key(category_name, channel_name, server_name)
 
             if webhook_key in self.webhook_cache:
                 continue
 
-            webhook = await self.get_or_create_webhook(channel)
+            webhook = await self.get_or_create_webhook(channel, server_name)
             if webhook:
-                self.webhook_cache[webhook_key] = webhook.url
-                redis_client.hset("webhooks", webhook_key, webhook.url)  # ✅ Store in Redis
+                webhook_url = webhook.url
+                WEBHOOKS[webhook_key] = webhook_url
+                redis_client.hset("webhooks", webhook_key, webhook_url)
                 self.save_config()
                 print(f"✅ Created webhook for {category_name}/{channel_name}")
 
-    async def get_or_create_webhook(self, channel):
+    async def get_or_create_webhook(self, channel, server_name):
         try:
             webhooks = await channel.webhooks()
-
-            # 🔧 Define category_name and channel_name safely
-            category_name = channel.category.name.lower().replace(" ", "-") if channel.category else "uncategorized"
-            channel_name = channel.name.lower().replace(" ", "-")
-            webhook_key = f"{category_name}/{channel_name}"
-
             if webhooks:
-                webhook = webhooks[0]
-                category_name = channel.category.name.lower().replace(" ", "-") if channel.category else "uncategorized"
-                channel_name = channel.name.lower().replace(" ", "-")
-                webhook_key = f"{category_name}/{channel_name}"
-
-                self.webhook_cache[webhook_key] = webhook.url
-                redis_client.hset("webhooks", webhook_key, webhook.url)
-                return webhook
-
-            await asyncio.sleep(2)
-            new_webhook = await channel.create_webhook(name="1Tap Notify")
-            webhook_key = f"{category_name}/{channel_name}"
-
-            self.webhook_cache[webhook_key] = new_webhook.url
-            redis_client.hset("webhooks", webhook_key, new_webhook.url)
-            print(f"✅ Created webhook for {category_name}/{channel_name}")
-            return new_webhook
-
-        except discord.HTTPException as e:
-            if e.status == 429:  # Handle rate limits
-                retry_after = int(e.response.headers.get("Retry-After", 60))
-                print(f"⚠️ Rate limited! Waiting {retry_after} seconds before retrying.")
-                await asyncio.sleep(retry_after)  # Wait and retry
-                return await self.get_or_create_webhook(channel)
-
-        except discord.Forbidden:
-            print(f"❌ ERROR: Missing permissions to create webhook in {channel.name}")
+                return webhooks[0]
+            await asyncio.sleep(1.5)
+            return await channel.create_webhook(name="1Tap Notify")
         except Exception as e:
             print(f"❌ ERROR: Failed to create webhook in {channel.name}: {e}")
-
-        return None
+            return None
 
     def save_config(self):
-        """Save updated config with webhook mappings."""
         config["webhooks"] = self.webhook_cache
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
 
+async def create_channel_and_webhook(category_name, channel_name, server_name):
+    guild = bot.get_guild(DESTINATION_SERVER_ID)
+    if not guild:
+        return None
+
+    # First, check if the channel already exists anywhere in the server
+    existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
+    if existing_channel:
+        print(f"📦 Found existing channel: {channel_name} (ID: {existing_channel.id})")
+        webhook = await bot.get_or_create_webhook(existing_channel, server_name)
+        if webhook:
+            webhook_key = normalize_key(category_name, channel_name, server_name)
+            WEBHOOKS[webhook_key] = webhook.url
+            redis_client.hset("webhooks", webhook_key, webhook.url)
+            bot.save_config()
+            return webhook.url
+        return None
+
+    # If not found, fallback to creating the category/channel
+    full_category_name = f"{category_name} [{server_name}]"
+    category = discord.utils.get(guild.categories, name=full_category_name)
+
+    template_category = discord.utils.get(guild.categories, name="INFORMATION [AK CHEFS]")
+    overwrites = template_category.overwrites if template_category else {}
+
+    if not category:
+        try:
+            category = await guild.create_category(full_category_name, overwrites=overwrites)
+            print(f"✅ Created category: {full_category_name}")
+        except Exception as e:
+            print(f"❌ Failed to create category '{full_category_name}': {e}")
+            return None
+
+    try:
+        channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
+        print(f"✅ Created channel: {channel_name}")
+    except Exception as e:
+        print(f"❌ Failed to create channel '{channel_name}': {e}")
+        return None
+
+    webhook = await bot.get_or_create_webhook(channel, server_name)
+    if webhook:
+        webhook_key = normalize_key(category_name, channel_name, server_name)
+        WEBHOOKS[webhook_key] = webhook.url
+        redis_client.hset("webhooks", webhook_key, webhook.url)
+        bot.save_config()
+        return webhook.url
+
+    return None
+
+
 async def process_message(request):
-    """Handle messages received from main.py"""
     try:
         message_data = await request.json()
-        print(f"📩 Received message: {message_data}")  # ✅ Debug
-
-        # Push the message into Redis queue
+        print(f"📩 Received message: {message_data}")
         redis_client.lpush("message_queue", json.dumps(message_data))
         return web.json_response({"status": "success", "message": "Message received"}, status=200)
     except Exception as e:
@@ -383,24 +256,17 @@ async def process_message(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 async def start_web_server():
-    """Start aiohttp web server to listen for messages from main.py"""
     app = web.Application()
     app.router.add_post("/process_message", process_message)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 5000)
     await site.start()
-    print("🌐 Web server running on http://127.0.0.1:5000")
 
 async def run_bot():
     global bot
-    global previous_structure
-    previous_structure = {}
-
     bot = DestinationBot(intents=discord.Intents.default())
     bot.webhook_cache = redis_client.hgetall("webhooks")
-
-    # Run bot and web server concurrently
     await asyncio.gather(bot.start(BOT_TOKEN), start_web_server())
 
 if __name__ == "__main__":

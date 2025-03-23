@@ -9,3 +9,4 @@ venv/
 .venv/
 logs/
 config.json
+config_notes.txt

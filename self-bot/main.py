@@ -7,6 +7,7 @@ import logging
 import redis
 import hashlib
 import traceback
+import signal
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -76,7 +77,7 @@ def get_server_info(server_id):
 
 class MirrorSelfBot(discord.Client):
     def __init__(self, token, monitored_servers):
-        super().__init__()
+        super().__init__(enable_guild_compression=True)
         self.token = token
         self.monitored_servers = {str(server_id) for server_id in monitored_servers}
         self.session = aiohttp.ClientSession()  # ✅ Initialize session here
@@ -85,10 +86,20 @@ class MirrorSelfBot(discord.Client):
         await self.fetch_guilds()
         print(f"✅ Self-bot {self.user} is now monitoring servers: {self.monitored_servers}")
 
+    async def on_disconnect(self):
+        logging.warning(f"🔌 Disconnected from Discord at {datetime.utcnow().isoformat()}")
+
+    async def on_resumed(self):
+        logging.info(f"🔄 Connection resumed with Discord at {datetime.utcnow().isoformat()}")
+
     async def on_message(self, message):
         """Process messages and ensure they belong to monitored servers."""
         if not message.guild:
             return  # Ignore DMs
+
+        # 🛑 Skip reposts from bots like "Posted by: ..."
+        if message.author.bot and message.content.lower().startswith("posted by"):
+            return
 
         server = message.guild
         server_id = str(server.id) if server else "Unknown"
@@ -182,22 +193,63 @@ async def start_self_bots():
 
         bot = MirrorSelfBot(token, server_ids)
 
-        # Create the task (don't await it here!)
-        asyncio.create_task(bot.start(token))
+        async def try_start_bot(bot_instance, token):
+            delay = 5
+            while True:
+                try:
+                    await bot_instance.start(token)
+                except Exception as e:
+                    logging.error(f"❌ Bot crashed or disconnected. Reconnecting in {delay} seconds. Error: {e}")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 300)  # cap backoff at 5 minutes
+
+        asyncio.create_task(try_start_bot(bot, token))
+
+def shutdown_handler(bot_instances):
+    async def handler():
+        logging.info("👋 Shutting down gracefully...")
+        for bot in bot_instances:
+            await bot.close()
+        await asyncio.sleep(2)
+        os._exit(0)
+    return handler
 
 # Start listening for requests
-if __name__ == "__main__":
-    async def main():
-        await start_self_bots()
+async def main():
+    bot_instances = []
 
-        # Give bots a second to login
-        print("⏳ Waiting for self-bots to finish login...")
-        await asyncio.sleep(5)
+    for index, (token, token_data) in enumerate(TOKENS.items()):
+        server_ids = set(token_data["servers"].keys())
+        print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
+        bot = MirrorSelfBot(token, server_ids)
+        bot_instances.append(bot)
 
-        # Prevent script from exiting
+        async def try_start_bot(bot_instance, token):
+            delay = 5
+            while True:
+                try:
+                    await bot_instance.start(token)
+                except Exception as e:
+                    logging.error(f"❌ Bot crashed or disconnected. Reconnecting in {delay} seconds. Error: {e}")
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 300)
+
+        # ⏳ Stagger bot launches by 5 seconds each
+        await asyncio.sleep(index * 5)
+        asyncio.create_task(try_start_bot(bot, token))
+
+    print("⏳ Waiting for self-bots to finish login...")
+
+    try:
         while True:
             await asyncio.sleep(3600)
+    finally:
+        print("👋 Shutting down...")
+        for bot in bot_instances:
+            await bot.close()
 
+
+if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main())

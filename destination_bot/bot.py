@@ -7,6 +7,8 @@ import logging
 import hashlib
 import argparse
 import os
+import time
+import threading
 from discord.ext import tasks
 from aiohttp import web
 from datetime import datetime
@@ -48,7 +50,7 @@ BOT_TOKEN = config.get("bot_token")
 DESTINATION_SERVER_ID = config["destination_server"]
 WEBHOOKS = config.get("webhooks", {})
 TOKENS = config.get("tokens", {})
-
+MAX_DISCORD_FILE_SIZE = 8 * 1024 * 1024  # 8MB
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
@@ -58,6 +60,36 @@ intents.guilds = True
 
 # Global cache to track recent message_ids and prevent duplicates
 recent_message_ids = set()
+
+def cleanup_dead_webhooks():
+    with open("config.json", "r") as f:
+        config = json.load(f)
+
+    updated_webhooks = {}
+    for server_id, channels in config.get("webhooks", {}).items():
+        updated_channels = {}
+        for channel_id, webhook_url in channels.items():
+            try:
+                response = requests.get(webhook_url)
+                if response.status_code == 200:
+                    updated_channels[channel_id] = webhook_url
+                else:
+                    log.warning(f"⚠️ Webhook {webhook_url} is dead (status {response.status_code})")
+            except:
+                log.warning(f"⚠️ Webhook {webhook_url} failed to check")
+
+        if updated_channels:
+            updated_webhooks[server_id] = updated_channels
+
+    config["webhooks"] = updated_webhooks
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=4)
+    log.info("✅ Dead webhooks cleaned up.")
+
+def schedule_cleanup():
+    while True:
+        cleanup_dead_webhooks()
+        time.sleep(1800)
 
 def normalize_key(category_name, channel_name, server_name):
     norm_category = category_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").replace("⚡", "").strip()
@@ -75,7 +107,7 @@ async def monitor_for_archive():
 
     def is_archive_message(msg):
         return (
-                isinstance(msg.channel, discord.TextChannel)
+                isinsstance(msg.channel, discord.TextChannel)
                 and "!archive" in msg.content.lower()
         )
 
@@ -108,15 +140,16 @@ async def process_redis_messages():
                     break
 
                 try:
-                    # Ensure we only process dict-like JSON objects
                     message = json.loads(message_data)
-
                     if not isinstance(message, dict):
-                        logging.warning(f"⚠️ Skipped invalid message (not a dict): {repr(message)}")
-                        continue
+                        raise ValueError("Invalid message format, expected dict")
+                    if "message_id" not in message:
+                        raise ValueError("Missing required field: message_id")
 
                     await send_to_webhook(message)
                     processed += 1
+                except Exception as e:
+                    logging.error(f"❌ Failed to process single Redis message: {e} → Data: {message_data}")
 
                 except json.JSONDecodeError as je:
                     logging.error(f"❌ JSON decode error: {je} → Raw data: {repr(message_data)}")
@@ -169,7 +202,6 @@ async def send_to_webhook(message_data):
 
     webhook_key = f"{category_name}-[{server_name}]/{channel_name}"
     webhook_url = WEBHOOKS.get(webhook_key)
-
     if not webhook_url:
         webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
         if not webhook_url:
@@ -185,52 +217,133 @@ async def send_to_webhook(message_data):
 
     cleaned_embeds = []
     for embed in embeds:
-        if isinstance(embed, dict):
+        if not isinstance(embed, dict):
+            continue
+        try:
             cleaned = {
                 "title": embed.get("title"),
                 "description": embed.get("description", ""),
                 "url": embed.get("url"),
                 "color": embed.get("color", 0x000000),
-                "fields": [
-                    {"name": f["name"], "value": f["value"]}
-                    for f in embed.get("fields", []) if "name" in f and "value" in f
-                ],
-                "thumbnail": {"url": embed.get("thumbnail")} if embed.get("thumbnail") else None,
-                "image": {"url": embed.get("image")} if embed.get("image") else None,
-                "footer": {"text": embed.get("footer", {}).get("text", "")} if embed.get("footer") else None,
-                "author": {"name": embed.get("author", {}).get("name", "")} if embed.get("author") else None,
+                "fields": [{"name": f["name"], "value": f["value"]} for f in embed.get("fields", []) if "name" in f and "value" in f],
+                "image": {"url": embed["image"]["url"]} if embed.get("image") and isinstance(embed["image"], dict) and "url" in embed["image"] else None,
+                "thumbnail": {"url": embed["thumbnail"]["url"]} if embed.get("thumbnail") and isinstance(embed["thumbnail"], dict) and "url" in embed["thumbnail"] else None,
+                "footer": {"text": embed["footer"]["text"]} if embed.get("footer") and isinstance(embed["footer"], dict) and "text" in embed["footer"] else None,
+                "author": {"name": embed["author"]["name"]} if embed.get("author") and isinstance(embed["author"], dict) and "name" in embed["author"] else None,
             }
-            cleaned_embeds.append(cleaned)
+            cleaned_embeds.append({k: v for k, v in cleaned.items() if v is not None})
+        except Exception as e:
+            logging.warning(f"❌ Embed error: {e}")
 
-    if not content and not cleaned_embeds and attachments:
-        cleaned_embeds.append({"image": {"url": attachments[0]}})
-
+    files = []
+    # Split message if over 2000 characters
     parts = [content[i:i + 2000] for i in range(0, len(content), 2000)] if content else [""]
-    if not parts and not cleaned_embeds:
-        return
+
+    # Download attachments to files (if any)
+    files = []
+    for idx, url in enumerate(attachments):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        file_data = await resp.read()
+                        filename = url.split("/")[-1].split("?")[0] or f"file{idx}.jpg"
+
+                        if len(file_data) <= MAX_DISCORD_FILE_SIZE:
+                            files.append({
+                                "filename": filename,
+                                "data": file_data
+                            })
+                        else:
+                            logging.warning(f"⚠️ File too large, skipping: {filename}")
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to fetch attachment: {url} → {e}")
 
     async with aiohttp.ClientSession() as session:
         for part in parts:
             for attempt in range(3):
                 try:
                     payload = {
-                        "content": part if part else None,
                         "username": message_data.get("author_name", "Unknown"),
                         "avatar_url": message_data.get("author_avatar"),
-                        "embeds": cleaned_embeds if part == parts[0] else []
+                        "content": part if part else None
                     }
-                    if not payload["content"]:
-                        del payload["content"]
 
+                    if not payload.get("content"):
+                        payload.pop("content", None)
+
+                    if part == parts[0] and cleaned_embeds and not files:
+                        payload["embeds"] = cleaned_embeds
+
+                    elif "embeds" in payload:
+                        payload.pop("embeds", None)  # prevent empty embeds from being sent
+
+                    # If message only has image attachments, treat as file upload instead of just an embed
+                    if not content.strip() and not cleaned_embeds and files:
+                        parts = [""]  # Force sending file even if no text or embed
+
+                    if files:
+                        from aiohttp import FormData
+                        form = FormData()
+                        for idx, file in enumerate(files):
+                            form.add_field(
+                                name=f"file{idx}",
+                                value=file["data"],
+                                filename=file["filename"],
+                                content_type="application/octet-stream"
+                            )
+                        form.add_field("payload_json", json.dumps(payload))
+
+                        async with session.post(webhook_url, data=form) as response:
+                            if response.status in (200, 204):
+                                break
+                            elif response.status == 404:
+                                error_text = await response.text()
+                                if "Unknown Webhook" in error_text:
+                                    logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Removing from config.")
+                                    WEBHOOKS.pop(webhook_key, None)
+                                    redis_client.hdel("webhooks", webhook_key)
+                                    bot.save_config()
+                                    webhook_url = await create_channel_and_webhook(category_name, channel_name,
+                                                                                   server_name)
+                                    if not webhook_url:
+                                        return
+                                elif "Unknown Channel" in error_text:
+                                    logging.warning(
+                                        f"⚠️ Channel '{channel_name}' no longer exists. Removing webhook + config for {webhook_key}.")
+                                    WEBHOOKS.pop(webhook_key, None)
+                                    redis_client.hdel("webhooks", webhook_key)
+                                    bot.save_config()
+                                    return
+                            elif response.status >= 500:
+                                logging.warning(f"⚠️ Discord error {response.status}, retry {attempt + 1}")
+                                await asyncio.sleep(2 * (attempt + 1))
+                            else:
+                                error = await response.text()
+                                logging.error(f"❌ Webhook file upload failed ({response.status}) → {error}")
+                                return
+                        continue  # 🛑 Skip next block since file was already sent
+
+                    # Fallback: JSON post without file
                     async with session.post(webhook_url, json=payload) as response:
                         if response.status in (200, 204):
-                            return
-                        elif response.status == 404 and "Unknown Webhook" in await response.text():
-                            logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Recreating...")
-                            WEBHOOKS.pop(webhook_key, None)
-                            redis_client.hdel("webhooks", webhook_key)
-                            webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
-                            if not webhook_url:
+                            break
+                        elif response.status == 404:
+                            error_text = await response.text()
+                            if "Unknown Webhook" in error_text:
+                                logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Removing from config.")
+                                WEBHOOKS.pop(webhook_key, None)
+                                redis_client.hdel("webhooks", webhook_key)
+                                bot.save_config()
+                                webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
+                                if not webhook_url:
+                                    return
+                            elif "Unknown Channel" in error_text:
+                                logging.warning(
+                                    f"⚠️ Channel '{channel_name}' no longer exists. Removing webhook + config for {webhook_key}.")
+                                WEBHOOKS.pop(webhook_key, None)
+                                redis_client.hdel("webhooks", webhook_key)
+                                bot.save_config()
                                 return
                         elif response.status >= 500:
                             logging.warning(f"⚠️ Discord error {response.status}, retry {attempt + 1}")
@@ -253,9 +366,28 @@ class DestinationBot(discord.Client):
         self.webhook_cache = redis_client.hgetall("webhooks")
         await self.ensure_webhooks()
         self.save_config()
+        await self.populate_category_mappings()
+        self.save_config()
         print("✅ Webhook setup complete. Bot is now processing messages.")
         asyncio.create_task(process_redis_messages())
         asyncio.create_task(monitor_for_archive())
+
+    async def populate_category_mappings(self):
+        """Auto-populate category_mappings in config.json with current categories from the destination server."""
+        guild = self.get_guild(DESTINATION_SERVER_ID)
+        if not guild:
+            logging.error("❌ ERROR: Cannot populate category mappings — destination server not found.")
+            return
+
+        if "category_mappings" not in config:
+            config["category_mappings"] = {}
+
+        for category in guild.categories:
+            name = category.name.strip()
+            if name not in config["category_mappings"].values():
+                # Suggest using same name as source (without [Server] suffix)
+                base_name = name.split(" [")[0]
+                config["category_mappings"][base_name] = name
 
     async def ensure_webhooks(self):
         guild = self.get_guild(DESTINATION_SERVER_ID)
@@ -376,6 +508,8 @@ async def run_bot():
     bot = DestinationBot(intents=discord.Intents.default())
     bot.webhook_cache = redis_client.hgetall("webhooks")
     await asyncio.gather(bot.start(BOT_TOKEN), start_web_server())
+    threading.Thread(target=schedule_cleanup, daemon=True).start()
+    cleanup_dead_webhooks()
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

@@ -132,7 +132,23 @@ class MirrorSelfBot(discord.Client):
 
         logging.info(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
 
+        # Map all roles mentioned in the message (id → name)
+        role_mentions = {}
+        for role in message.role_mentions:
+            role_mentions[str(role.id)] = role.name
+
+        reply_to = None
+        if message.reference and isinstance(message.reference.resolved, discord.Message):
+            reply_to = (message.reference.resolved.author.nick or str(message.reference.resolved.author)).replace("#0",
+                                                                                                                  "") \
+                if hasattr(message.reference.resolved.author, "nick") else str(
+                message.reference.resolved.author).replace("#0", "")
+
         message_data = {
+            "reply_to": reply_to,
+            "channel_real_name": message.channel.name,
+            "server_real_name": server.name,
+            "mentioned_roles": role_mentions,
             "message_id": str(message.id),
             "channel_id": str(message.channel.id),
             "channel_name": message.channel.name,
@@ -141,15 +157,15 @@ class MirrorSelfBot(discord.Client):
             "server_name": server_name,
             "content": message.content,
             "author_id": str(message.author.id),
-            "author_name": str(message.author),
+            "author_name": (getattr(message.author, "nick", None) or str(message.author)).replace("#0", ""),
             "author_avatar": message.author.avatar.url if message.author.avatar else None,
             "timestamp": str(message.created_at),
             "attachments": [attachment.url for attachment in message.attachments],
-            "embeds": [self.format_embed(embed) for embed in message.embeds] or (
-                [{"image": {"url": message.attachments[0].url}}] if message.attachments and message.attachments[
-                    0].content_type and message.attachments[0].content_type.startswith("image/") else []
+            "embeds": (
+                [self.format_embed(embed) for embed in message.embeds]
+                if message.embeds else
+                [{"image": {"url": message.attachments[0].url}}] if message.attachments else []
             ),
-
         }
 
         try:

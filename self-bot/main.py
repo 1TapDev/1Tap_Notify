@@ -93,12 +93,16 @@ class MirrorSelfBot(discord.Client):
         logging.info(f"🔄 Connection resumed with Discord at {datetime.utcnow().isoformat()}")
 
     async def on_message(self, message):
+        await asyncio.sleep(0.5)  # Small delay to let Discord register attachments
         """Process messages and ensure they belong to monitored servers."""
         if not message.guild:
             return  # Ignore DMs
 
-        # 🛑 Skip reposts from bots like "Posted by: ..."
-        if message.author.bot and message.content.lower().startswith("posted by"):
+        if (
+                message.author.bot
+                and "posted by" in message.content.lower()
+                and len(message.attachments) > 0
+        ):
             return
 
         server = message.guild
@@ -123,6 +127,9 @@ class MirrorSelfBot(discord.Client):
         if message.channel.id in excluded_channels:
             return
 
+        if not message.content and not message.attachments:
+            return  # 🛑 Skip empty messages without content or attachments
+
         logging.info(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
 
         message_data = {
@@ -138,7 +145,11 @@ class MirrorSelfBot(discord.Client):
             "author_avatar": message.author.avatar.url if message.author.avatar else None,
             "timestamp": str(message.created_at),
             "attachments": [attachment.url for attachment in message.attachments],
-            "embeds": [self.format_embed(embed) for embed in message.embeds],
+            "embeds": [self.format_embed(embed) for embed in message.embeds] or (
+                [{"image": {"url": message.attachments[0].url}}] if message.attachments and message.attachments[
+                    0].content_type and message.attachments[0].content_type.startswith("image/") else []
+            ),
+
         }
 
         try:
@@ -188,6 +199,9 @@ class MirrorSelfBot(discord.Client):
 
 async def start_self_bots():
     for token, token_data in TOKENS.items():
+        if token_data.get("disabled", False):
+            logging.warning(f"⛔ Token disabled: {token[:10]}... Skipping.")
+            continue
         server_ids = set(token_data["servers"].keys())
         print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
 
@@ -218,7 +232,8 @@ def shutdown_handler(bot_instances):
 async def main():
     bot_instances = []
 
-    for index, (token, token_data) in enumerate(TOKENS.items()):
+    enabled_tokens = [(t, d) for t, d in TOKENS.items() if not d.get("disabled", False)]
+    for index, (token, token_data) in enumerate(enabled_tokens):
         server_ids = set(token_data["servers"].keys())
         print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
         bot = MirrorSelfBot(token, server_ids)

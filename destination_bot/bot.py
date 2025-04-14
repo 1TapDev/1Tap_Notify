@@ -9,6 +9,8 @@ import argparse
 import os
 import time
 import threading
+import requests
+import re
 from discord.ext import tasks
 from aiohttp import web
 from datetime import datetime
@@ -62,29 +64,38 @@ intents.guilds = True
 recent_message_ids = set()
 
 def cleanup_dead_webhooks():
-    with open("config.json", "r") as f:
-        config = json.load(f)
+    logging.info("🧹 Starting cleanup of dead webhooks...")
 
-    updated_webhooks = {}
-    for server_id, channels in config.get("webhooks", {}).items():
-        updated_channels = {}
-        for channel_id, webhook_url in channels.items():
-            try:
-                response = requests.get(webhook_url)
-                if response.status_code == 200:
-                    updated_channels[channel_id] = webhook_url
-                else:
-                    log.warning(f"⚠️ Webhook {webhook_url} is dead (status {response.status_code})")
-            except:
-                log.warning(f"⚠️ Webhook {webhook_url} failed to check")
+    to_delete = []
 
-        if updated_channels:
-            updated_webhooks[server_id] = updated_channels
+    for key, webhook_url in list(config.get("webhooks", {}).items()):
+\
+        try:
+            response = requests.head(webhook_url, timeout=5)
+            if response.status_code in [404, 401, 403]:
+                try:
+                    data = response.json()
+                    if data.get("code") == 10015:
+                        to_delete.append(key)
+                    else:
+                        to_delete.append(key)
+                except Exception:
+                    to_delete.append(key)
+        except requests.RequestException as e:
+            logging.warning(f"[Webhook Checker] Request error for {webhook_url}: {e}")
+            to_delete.append(key)
 
-    config["webhooks"] = updated_webhooks
-    with open("config.json", "w") as f:
-        json.dump(config, f, indent=4)
-    log.info("✅ Dead webhooks cleaned up.")
+    for key in to_delete:
+        config["webhooks"].pop(key, None)
+        redis_client.hdel("webhooks", key)
+
+    if to_delete:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+        logging.info(f"✅ Removed {len(to_delete)} dead webhooks from config and Redis.")
+    else:
+        logging.info("✅ Cleanup completed — no dead webhooks found.")
+
 
 def schedule_cleanup():
     while True:
@@ -164,15 +175,25 @@ async def process_redis_messages():
         logging.error(f"❌ ERROR: Failed to process Redis messages: {e}")
 
 
-async def clean_mentions(content: str, destination_guild: discord.Guild) -> str:
-    # Replace <#channel_id> with #channel-name
-    for channel in destination_guild.text_channels:
-        mention = f"<#{channel.id}>"
-        if mention in content:
-            content = content.replace(mention, f"#{channel.name}")
+async def clean_mentions(content: str, destination_guild: discord.Guild, message_data: dict) -> str:
+
+    # Replace <#channel_id> with destination channel or fallback text
+    channel_mentions = re.findall(r"<#(\d+)>", content)
+    for channel_id in channel_mentions:
+        original_channel = bot.get_channel(int(channel_id))
+        original_name = message_data.get("channel_real_name", f"channel-{channel_id}")
+        server_name = message_data.get("server_real_name", "Unknown Server")
+
+        # Find a matching channel in the destination server by name
+        matching_channel = discord.utils.get(destination_guild.text_channels, name=original_name)
+        if matching_channel:
+            # Replace with clickable destination channel
+            content = content.replace(f"<#{channel_id}>", f"<#{matching_channel.id}>")
+        else:
+            # Replace with fallback text
+            content = content.replace(f"<#{channel_id}>", f"`{server_name} > #{original_name}`")
 
     # Replace <@user_id> with @username#discriminator
-    import re
     user_mentions = re.findall(r"<@!?(\d+)>", content)
     for user_id in user_mentions:
         try:
@@ -182,7 +203,34 @@ async def clean_mentions(content: str, destination_guild: discord.Guild) -> str:
         except Exception:
             content = content.replace(f"<@{user_id}>", "@unknown")
 
+    # Replace <@&role_id> with matching role in destination or create it
+    role_mentions = re.findall(r"<@&(\d+)>", content)
+    source_role_map = message_data.get("mentioned_roles", {})
+
+    for role_id in role_mentions:
+        role_name = source_role_map.get(role_id, f"AutoRole-{role_id}")
+        dest_role = discord.utils.get(destination_guild.roles, name=role_name)
+
+        if not dest_role:
+            # Create based on MEMBERS
+            base_role = discord.utils.get(destination_guild.roles, name="MEMBERS")
+            if base_role:
+                dest_role = await destination_guild.create_role(
+                    name=role_name,
+                    permissions=base_role.permissions,
+                    color=base_role.color,
+                    hoist=False,
+                    mentionable=True
+                )
+                logging.info(f"✅ Created role '{role_name}' based on MEMBERS")
+            else:
+                content = content.replace(f"<@&{role_id}>", f"@{role_name}")
+                continue
+
+        content = content.replace(f"<@&{role_id}>", f"<@&{dest_role.id}>")
+
     return content
+
 
 async def send_to_webhook(message_data):
     message_id = message_data.get("message_id")
@@ -207,7 +255,12 @@ async def send_to_webhook(message_data):
         if not webhook_url:
             return
 
-    content = await clean_mentions(message_data.get("content", ""), bot.get_guild(DESTINATION_SERVER_ID))
+    content = await clean_mentions(
+        message_data.get("content", ""),
+        bot.get_guild(DESTINATION_SERVER_ID),
+        message_data
+    )
+
     reply_text = f"[in reply to @{message_data['reply_to']}]" if message_data.get("reply_to") else ""
     if reply_text:
         content = f"{reply_text}\n{content}"
@@ -226,7 +279,7 @@ async def send_to_webhook(message_data):
                 "url": embed.get("url"),
                 "color": embed.get("color", 0x000000),
                 "fields": [{"name": f["name"], "value": f["value"]} for f in embed.get("fields", []) if "name" in f and "value" in f],
-                "image": {"url": embed["image"]["url"]} if embed.get("image") and isinstance(embed["image"], dict) and "url" in embed["image"] else None,
+                "image": {"url": embed["image"]} if isinstance(embed.get("image"), str) else embed.get("image") if isinstance(embed.get("image"), dict) else None,
                 "thumbnail": {"url": embed["thumbnail"]["url"]} if embed.get("thumbnail") and isinstance(embed["thumbnail"], dict) and "url" in embed["thumbnail"] else None,
                 "footer": {"text": embed["footer"]["text"]} if embed.get("footer") and isinstance(embed["footer"], dict) and "text" in embed["footer"] else None,
                 "author": {"name": embed["author"]["name"]} if embed.get("author") and isinstance(embed["author"], dict) and "name" in embed["author"] else None,
@@ -236,6 +289,12 @@ async def send_to_webhook(message_data):
             logging.warning(f"❌ Embed error: {e}")
 
     files = []
+    # ⏭️ Skip truly empty messages (no content, no embeds, no attachments)
+    if not content.strip() and not cleaned_embeds and not attachments:
+        logging.info(
+            f"⏭️ Skipped empty message_id={message_data.get('message_id')} from {message_data.get('author_name')}")
+        return
+
     # Split message if over 2000 characters
     parts = [content[i:i + 2000] for i in range(0, len(content), 2000)] if content else [""]
 
@@ -507,9 +566,14 @@ async def run_bot():
     global bot
     bot = DestinationBot(intents=discord.Intents.default())
     bot.webhook_cache = redis_client.hgetall("webhooks")
-    await asyncio.gather(bot.start(BOT_TOKEN), start_web_server())
+
+    # Start cleanup thread BEFORE blocking bot loop
     threading.Thread(target=schedule_cleanup, daemon=True).start()
-    cleanup_dead_webhooks()
+
+    await asyncio.gather(
+        bot.start(BOT_TOKEN),
+        start_web_server()
+    )
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

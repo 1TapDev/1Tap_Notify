@@ -11,6 +11,7 @@ import time
 import threading
 import requests
 import re
+from discord.ext import commands
 from discord.ext import tasks
 from aiohttp import web
 from datetime import datetime
@@ -59,9 +60,34 @@ redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=T
 # Initialize bot
 intents = discord.Intents.default()
 intents.guilds = True
+intents.message_content = True  # ✅ Add this line
+bot = commands.Bot(command_prefix="!", intents=intents)
+bot.webhook_cache = redis_client.hgetall("webhooks")
 
 # Global cache to track recent message_ids and prevent duplicates
 recent_message_ids = set()
+
+def get_next_version():
+    version_file = "version.txt"
+    if not os.path.exists(version_file):
+        with open(version_file, "w") as f:
+            f.write("1.0")
+
+    with open(version_file, "r") as f:
+        current = f.read().strip()
+
+    major, minor = map(int, current.split("."))
+    if minor >= 9:
+        major += 1
+        minor = 0
+    else:
+        minor += 1
+
+    next_version = f"{major}.{minor}"
+    with open(version_file, "w") as f:
+        f.write(next_version)
+
+    return next_version
 
 def cleanup_dead_webhooks():
     logging.info("🧹 Starting cleanup of dead webhooks...")
@@ -96,6 +122,8 @@ def cleanup_dead_webhooks():
     else:
         logging.info("✅ Cleanup completed — no dead webhooks found.")
 
+def strip_emojis(text):
+    return re.sub(r'[^\w\s\[\]-]', '', text).strip()
 
 def schedule_cleanup():
     while True:
@@ -116,27 +144,52 @@ async def monitor_for_archive():
         logging.error("❌ Destination server not found in monitor_for_archive")
         return
 
-    def is_archive_message(msg):
-        return (
-                isinsstance(msg.channel, discord.TextChannel)
-                and "!archive" in msg.content.lower()
-        )
-
     while not bot.is_closed():
         try:
             for channel in guild.text_channels:
                 try:
                     messages = [message async for message in channel.history(limit=50)]
                     for msg in messages:
-                        if isinstance(msg.channel, discord.TextChannel) and "!archive" in msg.content.lower():
-                            logging.info(f"🗑️ Deleting channel '{channel.name}' due to archive trigger: {msg.content}")
-                            await channel.delete(reason="Archive keyword detected in message")
-                            break  # Stop checking more messages in this channel
+                        if "!archive" in msg.content.lower():
+                            logging.info(f"🗑️ Archive command detected in '{channel.name}' → Message: {msg.content}")
+
+                            server_name_raw = guild.name
+                            category_name_raw = channel.category.name if channel.category else "Uncategorized"
+
+                            server_name = server_name_raw.split(" [")[0].strip()
+                            category_name = category_name_raw.split(" [")[0].strip()
+                            logging.info(f"📂 Archive check: Server='{server_name}' | Category='{category_name}'")
+
+                            forum_mappings = config.get("archived_forums", {})
+                            forum_target = forum_mappings.get(server_name, {}).get(category_name)
+
+                            logging.info(f"🔍 Looking for: forum_mappings[{server_name}][{category_name}]")
+                            logging.info(f"📦 Full forum mappings: {forum_mappings}")
+
+                            if not forum_target:
+                                logging.warning(f"⚠️ No forum mapping for '{category_name}' in server '{server_name}'")
+                            else:
+                                forum_channel = discord.utils.get(guild.forum_channels, name=forum_target)
+                                if forum_channel:
+                                    try:
+                                        base_msg = await forum_channel.send(
+                                            content=f"Auto-archived from #{channel.name}")
+                                        thread = await forum_channel.create_thread(name=channel.name, message=base_msg)
+                                        logging.info(f"✅ Created thread '{thread.name}' in forum '{forum_target}'")
+                                    except Exception as e:
+                                        logging.error(f"❌ Failed to create thread in forum '{forum_target}': {e}")
+                                else:
+                                    logging.warning(f"⚠️ Forum channel '{forum_target}' not found in guild")
+
+                            await channel.delete(reason="!archive command triggered")
+                            logging.info(f"✅ Deleted channel '{channel.name}'")
+
+                            break  # Stop checking this channel after archiving
                 except discord.Forbidden:
-                    logging.warning(f"⚠️ No permission to read/delete in channel: {channel.name}")
+                    logging.warning(f"⚠️ No permission to access '{channel.name}'")
                 except Exception as e:
-                    logging.error(f"❌ Failed checking channel '{channel.name}': {e}")
-            await asyncio.sleep(10)  # Check every 10 seconds
+                    logging.error(f"❌ Exception in monitor_for_archive for '{channel.name}': {e}")
+            await asyncio.sleep(10)
         except Exception as e:
             logging.error(f"❌ monitor_for_archive loop error: {e}")
             await asyncio.sleep(5)
@@ -261,7 +314,12 @@ async def send_to_webhook(message_data):
         message_data
     )
 
-    reply_text = f"[in reply to @{message_data['reply_to']}]" if message_data.get("reply_to") else ""
+    forwarded_text = f"> **Forwarded from @{message_data['forwarded_from']}**" if message_data.get(
+        "forwarded_from") else ""
+    if forwarded_text:
+        content = f"{forwarded_text}\n{content}"
+
+    reply_text = f"> **Replying to @{message_data['reply_to']}**" if message_data.get("reply_to") else ""
     if reply_text:
         content = f"{reply_text}\n{content}"
 
@@ -273,20 +331,20 @@ async def send_to_webhook(message_data):
         if not isinstance(embed, dict):
             continue
         try:
-            cleaned = {
-                "title": embed.get("title"),
-                "description": embed.get("description", ""),
-                "url": embed.get("url"),
-                "color": embed.get("color", 0x000000),
-                "fields": [{"name": f["name"], "value": f["value"]} for f in embed.get("fields", []) if "name" in f and "value" in f],
-                "image": {"url": embed["image"]} if isinstance(embed.get("image"), str) else embed.get("image") if isinstance(embed.get("image"), dict) else None,
-                "thumbnail": {"url": embed["thumbnail"]["url"]} if embed.get("thumbnail") and isinstance(embed["thumbnail"], dict) and "url" in embed["thumbnail"] else None,
-                "footer": {"text": embed["footer"]["text"]} if embed.get("footer") and isinstance(embed["footer"], dict) and "text" in embed["footer"] else None,
-                "author": {"name": embed["author"]["name"]} if embed.get("author") and isinstance(embed["author"], dict) and "name" in embed["author"] else None,
-            }
-            cleaned_embeds.append({k: v for k, v in cleaned.items() if v is not None})
+            embed_copy = embed.copy()
+
+            # Auto-fix known subfields
+            if "image" in embed_copy and isinstance(embed_copy["image"], str):
+                embed_copy["image"] = {"url": embed_copy["image"]}
+
+            # Basic cleanup
+            for key in list(embed_copy.keys()):
+                if embed_copy[key] is None:
+                    del embed_copy[key]
+
+            cleaned_embeds.append(embed_copy)
         except Exception as e:
-            logging.warning(f"❌ Embed error: {e}")
+            logging.warning(f"❌ Embed processing failed: {e}")
 
     files = []
     # ⏭️ Skip truly empty messages (no content, no embeds, no attachments)
@@ -414,7 +472,7 @@ async def send_to_webhook(message_data):
                     logging.error(f"❌ Exception during webhook post: {e}")
                     await asyncio.sleep(2 * (attempt + 1))
 
-class DestinationBot(discord.Client):
+class DestinationBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.webhook_cache = WEBHOOKS
@@ -493,7 +551,36 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
     if not guild:
         return None
 
-    # First, check if the channel already exists anywhere in the server
+    forum_mappings = config.get("forum_mappings", {})
+
+    # Check if this category/server combo should be routed to a forum
+    full_key = f"{category_name.strip()} [{server_name.strip()}]".lower()
+    mapped_forum_name = forum_mappings.get(full_key)
+
+    if mapped_forum_name:
+        # Try to find forum channel
+        forum_channel = discord.utils.get(guild.forum_channels, name=mapped_forum_name)
+        if forum_channel:
+            try:
+                message = await forum_channel.send(content="Auto-archived from original channel")
+                thread = await forum_channel.create_thread(
+                    name=channel.name,
+                    message=message,
+                    reason="!archive triggered"
+                )
+                webhook = await bot.get_or_create_webhook(thread, server_name)
+                if webhook:
+                    webhook_key = normalize_key(category_name, channel_name, server_name)
+                    WEBHOOKS[webhook_key] = webhook.url
+                    redis_client.hset("webhooks", webhook_key, webhook.url)
+                    bot.save_config()
+                    logging.info(f"✅ Created forum thread '{channel_name}' in '{mapped_forum_name}'")
+                    return webhook.url
+            except Exception as e:
+                logging.error(f"❌ Failed to create thread in forum '{mapped_forum_name}': {e}")
+                return None
+
+    # fallback: regular text channel flow
     existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
     if existing_channel:
         logging.info(f"📦 Found existing channel: {channel_name} (ID: {existing_channel.id})")
@@ -506,7 +593,7 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
             return webhook.url
         return None
 
-    # ✅ FIX: Match any existing category that closely matches the intended category name
+    # Match category
     category = None
     for cat in guild.categories:
         cat_normalized = cat.name.lower().replace(" ", "-").replace("|", "").replace("︱", "")
@@ -528,9 +615,9 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
 
     try:
         channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
-        logging.info(f"✅ Created channel: {channel_name}")
+        logging.info(f"✅ Created text channel: {channel_name}")
     except Exception as e:
-        logging.error(f"❌ Failed to create channel '{channel_name}': {e}")
+        logging.error(f"❌ Failed to create text channel '{channel_name}': {e}")
         return None
 
     webhook = await bot.get_or_create_webhook(channel, server_name)
@@ -542,7 +629,6 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
         return webhook.url
 
     return None
-
 
 async def process_message(request):
     try:
@@ -564,8 +650,6 @@ async def start_web_server():
 
 async def run_bot():
     global bot
-    bot = DestinationBot(intents=discord.Intents.default())
-    bot.webhook_cache = redis_client.hgetall("webhooks")
 
     # Start cleanup thread BEFORE blocking bot loop
     threading.Thread(target=schedule_cleanup, daemon=True).start()
@@ -574,6 +658,27 @@ async def run_bot():
         bot.start(BOT_TOKEN),
         start_web_server()
     )
+
+@bot.command()
+async def update(ctx, *, description):
+    updates_channel_id = config.get("updates_channel_id")
+    channel = bot.get_channel(updates_channel_id)
+    if not channel:
+        await ctx.send("❌ Updates channel not configured or not found.")
+        return
+
+    version = get_next_version()
+    timestamp = datetime.now().strftime("%b %d, %Y | %H:%M:%S")
+
+    embed = discord.Embed(
+        title="🔔 New update!",
+        description=description.strip(),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"Update {version} | 1Tap Notify [{timestamp}]")
+
+    await channel.send(embed=embed)
+    await ctx.send("✅ Update posted.")
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

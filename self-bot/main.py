@@ -178,17 +178,16 @@ class MirrorSelfBot(discord.Client):
         await self.send_to_destination(message_data)
 
     def format_embed(self, embed):
-        """Format an embed for sending to bot.py"""
         return {
             "title": embed.title or None,
             "description": embed.description or None,
             "url": embed.url or None,
             "color": embed.color.value if embed.color else None,
             "fields": [{"name": field.name, "value": field.value} for field in embed.fields] if embed.fields else [],
-            "image": embed.image.url if embed.image else None,
-            "thumbnail": embed.thumbnail.url if embed.thumbnail else None,
-            "footer": embed.footer.text if embed.footer else None,
-            "author": embed.author.name if embed.author else None,
+            "image": {"url": embed.image.url} if embed.image else None,
+            "thumbnail": {"url": embed.thumbnail.url} if embed.thumbnail else None,
+            "footer": {"text": embed.footer.text} if embed.footer else None,
+            "author": {"name": embed.author.name} if embed.author else None,
         }
 
     async def send_to_destination(self, message_data, retries=3):

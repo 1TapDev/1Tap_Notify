@@ -57,13 +57,6 @@ MAX_DISCORD_FILE_SIZE = 8 * 1024 * 1024  # 8MB
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
-# Initialize bot
-intents = discord.Intents.default()
-intents.guilds = True
-intents.message_content = True  # ✅ Add this line
-bot = commands.Bot(command_prefix="!", intents=intents)
-bot.webhook_cache = redis_client.hgetall("webhooks")
-
 # Global cache to track recent message_ids and prevent duplicates
 recent_message_ids = set()
 
@@ -95,7 +88,6 @@ def cleanup_dead_webhooks():
     to_delete = []
 
     for key, webhook_url in list(config.get("webhooks", {}).items()):
-\
         try:
             response = requests.head(webhook_url, timeout=5)
             if response.status_code in [404, 401, 403]:
@@ -130,11 +122,31 @@ def schedule_cleanup():
         cleanup_dead_webhooks()
         time.sleep(1800)
 
+def normalize_category(name):
+    name = re.sub(r"[^\w\s\[\]\-()]", "", name)
+    return name.lower().replace("  ", " ").strip()
+
+def normalize_server_tag(tag):
+    return tag.lower().strip()
+
 def normalize_key(category_name, channel_name, server_name):
     norm_category = category_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").replace("⚡", "").strip()
     norm_channel = channel_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").strip()
     norm_server = server_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").strip()
     return f"{norm_category}-[{norm_server}]/{norm_channel}"
+
+def normalize_name(name: str) -> str:
+    return (
+        name.lower()
+        .replace("–", "-")  # En dash
+        .replace("—", "-")  # Em dash
+        .replace("‒", "-")  # Figure dash
+        .replace("‘", "'")
+        .replace("’", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+        .strip()
+    )
 
 async def monitor_for_archive():
     await bot.wait_until_ready()
@@ -161,7 +173,9 @@ async def monitor_for_archive():
                             logging.info(f"📂 Archive check: Server='{server_name}' | Category='{category_name}'")
 
                             forum_mappings = config.get("archived_forums", {})
-                            forum_target = forum_mappings.get(server_name, {}).get(category_name)
+                            normalized_category = normalize_category(category_name)
+                            normalized_server = normalize_server_tag(server_name)
+                            forum_target = forum_mappings.get(f"{normalized_category} [{normalized_server}]")
 
                             logging.info(f"🔍 Looking for: forum_mappings[{server_name}][{category_name}]")
                             logging.info(f"📦 Full forum mappings: {forum_mappings}")
@@ -473,8 +487,14 @@ async def send_to_webhook(message_data):
                     await asyncio.sleep(2 * (attempt + 1))
 
 class DestinationBot(commands.Bot):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.reactions = True
+        intents.members = True
+
+        super().__init__(command_prefix="!", intents=intents)
         self.webhook_cache = WEBHOOKS
         self.event(self.on_ready)
 
@@ -482,12 +502,69 @@ class DestinationBot(commands.Bot):
         print(f"✅ Bot {self.user} is running!")
         self.webhook_cache = redis_client.hgetall("webhooks")
         await self.ensure_webhooks()
-        self.save_config()
+        await self.migrate_channels_to_uncategorized()
         await self.populate_category_mappings()
         self.save_config()
         print("✅ Webhook setup complete. Bot is now processing messages.")
         asyncio.create_task(process_redis_messages())
         asyncio.create_task(monitor_for_archive())
+
+    async def migrate_channels_to_uncategorized(self):
+        guild = self.get_guild(DESTINATION_SERVER_ID)
+        if not guild:
+            logging.error("❌ Destination server not found for migration.")
+            return
+
+        ignored_tags = config.get("ignored_category_tags", [])
+        uncategorized_category = None
+
+        for category in guild.categories:
+            # Skip if category has ignored tag
+            if any(tag in category.name for tag in ignored_tags):
+                continue
+
+            # Try to extract server name tag from category
+            if "[" in category.name and "]" in category.name:
+                server_tag = category.name.split("[")[-1].split("]")[0].strip()
+            else:
+                continue  # No tag found
+
+            for channel in category.channels:
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+
+                # Skip if name already ends with tag
+                if channel.name.endswith(f"[{server_tag.lower()}]") or f"[{server_tag}]" in channel.name:
+                    continue
+
+                new_name = f"{channel.name} [{server_tag}]"
+
+                normalized_new_name = new_name.lower()
+                conflict = discord.utils.find(lambda c: c.name.lower() == normalized_new_name, guild.text_channels)
+
+                if conflict:
+                    logging.warning(
+                        f"⚠️ Skipped renaming '{channel.name}' to avoid conflict with existing '{conflict.name}'.")
+                    continue
+
+                try:
+                    await channel.edit(name=new_name, category=None)
+                    logging.info(f"✅ Renamed '{channel.name}' to '{new_name}' and moved to Uncategorized.")
+                    # Update webhook key if one existed
+                    normalized_cat = normalize_category(category.name)
+                    normalized_srv = normalize_server_tag(server_tag)
+
+                    old_key = normalize_key(normalized_cat, channel.name, normalized_srv)
+                    new_key = normalize_key("uncategorized", new_name, normalized_srv)
+
+                    if old_key in WEBHOOKS:
+                        WEBHOOKS[new_key] = WEBHOOKS.pop(old_key)
+                        redis_client.hset("webhooks", new_key, WEBHOOKS[new_key])
+                        self.save_config()
+                        logging.info(f"🔁 Updated webhook key: '{old_key}' ➜ '{new_key}'")
+
+                except Exception as e:
+                    logging.error(f"❌ Failed to rename/move channel '{channel.name}': {e}")
 
     async def populate_category_mappings(self):
         """Auto-populate category_mappings in config.json with current categories from the destination server."""
@@ -512,12 +589,22 @@ class DestinationBot(commands.Bot):
             logging.error("❌ ERROR: Destination server not found!")
             return
 
-        server_name = guild.name
+        server_name = guild.name.lower().replace(" ", "-").replace("|", "").strip()
 
         for channel in guild.text_channels:
-            category_name = channel.category.name.lower().replace(" ", "-").replace("|", "") if channel.category else "uncategorized"
-            channel_name = channel.name.lower().replace(" ", "-").replace("|", "")
-            webhook_key = normalize_key(category_name, channel_name, server_name)
+            category_name = (
+                channel.category.name.lower().replace(" ", "-").replace("|", "").strip()
+                if channel.category else "uncategorized"
+            )
+            channel_name = channel.name.lower().replace(" ", "-").replace("|", "").strip()
+
+            possible_keys = [
+                normalize_key(category_name, channel_name, server_name),
+                normalize_key(category_name, f"{channel_name}-{server_name}", ""),
+                normalize_key(category_name, f"{channel_name}_{server_name}", ""),
+            ]
+
+            webhook_key = next((key for key in possible_keys if key in WEBHOOKS), possible_keys[0])
 
             if webhook_key in self.webhook_cache:
                 continue
@@ -551,26 +638,34 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
     if not guild:
         return None
 
+    # Normalize everything early
+    category_name = category_name.lower().replace(" ", "-").replace("|", "").strip()
+    channel_name = channel_name.lower().replace(" ", "-").replace("|", "").strip()
+    server_name = server_name.lower().replace(" ", "-").replace("|", "").strip()
+    target_names = [
+        normalize_name(f"{channel_name} [{server_name}]"),
+        normalize_name(f"{channel_name}-{server_name}"),
+        normalize_name(f"{channel_name}_{server_name}"),
+        normalize_name(f"{server_name}-{channel_name}"),
+    ]
+    webhook_key = normalize_key(category_name, channel_name, server_name)
     forum_mappings = config.get("forum_mappings", {})
+    full_key = f"{category_name} [{server_name}]"
 
-    # Check if this category/server combo should be routed to a forum
-    full_key = f"{category_name.strip()} [{server_name.strip()}]".lower()
+    # Check if this should go to a forum
     mapped_forum_name = forum_mappings.get(full_key)
-
     if mapped_forum_name:
-        # Try to find forum channel
         forum_channel = discord.utils.get(guild.forum_channels, name=mapped_forum_name)
         if forum_channel:
             try:
-                message = await forum_channel.send(content="Auto-archived from original channel")
+                msg = await forum_channel.send(content="Auto-archived from original channel")
                 thread = await forum_channel.create_thread(
-                    name=channel.name,
-                    message=message,
+                    name=channel_name,
+                    message=msg,
                     reason="!archive triggered"
                 )
                 webhook = await bot.get_or_create_webhook(thread, server_name)
                 if webhook:
-                    webhook_key = normalize_key(category_name, channel_name, server_name)
                     WEBHOOKS[webhook_key] = webhook.url
                     redis_client.hset("webhooks", webhook_key, webhook.url)
                     bot.save_config()
@@ -580,49 +675,43 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
                 logging.error(f"❌ Failed to create thread in forum '{mapped_forum_name}': {e}")
                 return None
 
-    # fallback: regular text channel flow
-    existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
+    # Check if an uncategorized channel already exists (normalized)
+    existing_channel_names = [
+        normalize_name(c.name) for c in guild.text_channels
+    ]
+    target_names = [
+        normalize_name(f"{channel_name} [{server_name}]"),
+        normalize_name(f"{channel_name}-{server_name}"),
+        normalize_name(f"{channel_name}_{server_name}"),
+        normalize_name(f"{server_name}-{channel_name}"),
+    ]
+
+    existing_channel = discord.utils.find(
+        lambda c: normalize_name(c.name) in target_names,
+        guild.text_channels
+    )
+
     if existing_channel:
-        logging.info(f"📦 Found existing channel: {channel_name} (ID: {existing_channel.id})")
+        logging.info(f"📦 Found existing channel: {existing_channel.name} — skipping creation.")
         webhook = await bot.get_or_create_webhook(existing_channel, server_name)
         if webhook:
-            webhook_key = normalize_key(category_name, channel_name, server_name)
             WEBHOOKS[webhook_key] = webhook.url
             redis_client.hset("webhooks", webhook_key, webhook.url)
             bot.save_config()
             return webhook.url
         return None
 
-    # Match category
-    category = None
-    for cat in guild.categories:
-        cat_normalized = cat.name.lower().replace(" ", "-").replace("|", "").replace("︱", "")
-        if category_name in cat_normalized:
-            category = cat
-            break
-
-    template_category = discord.utils.get(guild.categories, name="INFORMATION [AK CHEFS]")
-    overwrites = template_category.overwrites if template_category else {}
-
-    if not category:
-        try:
-            full_category_name = f"{category_name} [{server_name}]"
-            category = await guild.create_category(full_category_name, overwrites=overwrites)
-            logging.info(f"✅ Created category: {full_category_name}")
-        except Exception as e:
-            logging.error(f"❌ Failed to create category '{full_category_name}': {e}")
-            return None
-
+    # Create new uncategorized channel
+    full_channel_name = f"{channel_name} [{server_name}]"
     try:
-        channel = await guild.create_text_channel(name=channel_name, category=category, overwrites=overwrites)
-        logging.info(f"✅ Created text channel: {channel_name}")
+        channel = await guild.create_text_channel(name=full_channel_name)
+        logging.info(f"✅ Created uncategorized channel: {channel.name}")
     except Exception as e:
-        logging.error(f"❌ Failed to create text channel '{channel_name}': {e}")
+        logging.error(f"❌ Failed to create text channel '{full_channel_name}': {e}")
         return None
 
     webhook = await bot.get_or_create_webhook(channel, server_name)
     if webhook:
-        webhook_key = normalize_key(category_name, channel_name, server_name)
         WEBHOOKS[webhook_key] = webhook.url
         redis_client.hset("webhooks", webhook_key, webhook.url)
         bot.save_config()
@@ -649,15 +738,16 @@ async def start_web_server():
     await site.start()
 
 async def run_bot():
-    global bot
+    bot.webhook_cache = redis_client.hgetall("webhooks")
 
-    # Start cleanup thread BEFORE blocking bot loop
     threading.Thread(target=schedule_cleanup, daemon=True).start()
 
     await asyncio.gather(
         bot.start(BOT_TOKEN),
         start_web_server()
     )
+
+bot = DestinationBot()
 
 @bot.command()
 async def update(ctx, *, description):

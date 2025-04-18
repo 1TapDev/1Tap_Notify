@@ -298,9 +298,61 @@ async def clean_mentions(content: str, destination_guild: discord.Guild, message
 
     return content
 
+async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data: dict) -> dict:
+    """Fix mentions inside embed fields like <#id>, <@id>, <@&id>."""
+    description = embed.get("description", "")
+    if not description:
+        return embed
+
+    # Handle <#channel_id>
+    for match in re.findall(r"<#(\d+)>", description):
+        original_channel_name = message_data.get("channel_real_name", "")
+        server_name = message_data.get("server_real_name", "").lower().replace(" ", "-")
+        expected_name = f"{original_channel_name} [{server_name}]"
+        channel = discord.utils.get(guild.text_channels, name=expected_name)
+        replacement = f"<#{channel.id}>" if channel else f"`{server_name} > #{original_channel_name}`"
+        description = description.replace(f"<#{match}>", replacement)
+
+    # Handle <@user_id>
+    for match in re.findall(r"<@!?(\d+)>", description):
+        try:
+            user_obj = await bot.fetch_user(int(match))
+            tag = f"@{user_obj.name}#{user_obj.discriminator}"
+        except Exception:
+            tag = f"@user-{match}"
+        description = re.sub(f"<@!?{match}>", tag, description)
+
+    # Handle <@&role_id>
+    for match in re.findall(r"<@&(\d+)>", description):
+        role_name = message_data.get("mentioned_roles", {}).get(match, f"AutoRole-{match}")
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role:
+            base = discord.utils.get(guild.roles, name="MEMBERS")
+            if base:
+                role = await guild.create_role(name=role_name, permissions=base.permissions, color=base.color)
+        if role:
+            description = description.replace(f"<@&{match}>", f"<@&{role.id}>")
+        else:
+            description = description.replace(f"<@&{match}>", f"@{role_name}")
+
+    embed["description"] = description
+    return embed
+
 
 async def send_to_webhook(message_data):
     message_id = message_data.get("message_id")
+    # Auto-delete if archive command detected
+    archive_trigger = message_data.get("content", "").strip().lower()
+    if archive_trigger in ["!archive", "channel archive"]:
+        channel_obj = bot.get_channel(int(message_data["channel_id"]))
+        if channel_obj:
+            try:
+                await channel_obj.delete(reason="Triggered by archive command")
+                logging.info(f"🗑️ Deleted channel '{channel_obj.name}' due to archive trigger")
+            except Exception as e:
+                logging.error(f"❌ Failed to delete channel '{channel_obj.id}': {e}")
+        return
+
     if message_id in recent_message_ids:
         return
     recent_message_ids.add(message_id)
@@ -339,6 +391,8 @@ async def send_to_webhook(message_data):
 
     attachments = message_data.get("attachments", [])
     embeds = message_data.get("embeds", [])
+    if not embeds:
+        logging.warning(f"⚠️ No embeds received from main.py → message_id={message_id}")
 
     cleaned_embeds = []
     for embed in embeds:
@@ -347,16 +401,47 @@ async def send_to_webhook(message_data):
         try:
             embed_copy = embed.copy()
 
-            # Auto-fix known subfields
-            if "image" in embed_copy and isinstance(embed_copy["image"], str):
-                embed_copy["image"] = {"url": embed_copy["image"]}
+            # Check if embed has any meaningful field
+            if not any([
+                embed_copy.get("title"),
+                embed_copy.get("description"),
+                embed_copy.get("url"),
+                embed_copy.get("image"),
+                embed_copy.get("thumbnail"),
+                embed_copy.get("fields")
+            ]):
+                logging.warning(f"⚠️ Embed skipped due to missing core fields:\n{json.dumps(embed_copy, indent=2)}")
+                continue
 
-            # Basic cleanup
+            core_fields = [
+                embed_copy.get("title"),
+                embed_copy.get("description"),
+                embed_copy.get("url"),
+                embed_copy.get("image", {}).get("url") if isinstance(embed_copy.get("image"), dict) else embed_copy.get(
+                    "image"),
+                embed_copy.get("thumbnail", {}).get("url") if isinstance(embed_copy.get("thumbnail"),
+                                                                         dict) else embed_copy.get("thumbnail"),
+                embed_copy.get("fields")
+            ]
+            if not any(core_fields):
+                logging.warning(f"⚠️ Embed skipped due to missing core fields:\n{json.dumps(embed_copy, indent=2)}")
+                continue
+
+            # Clean malformed image field if needed
+            if "image" in embed_copy:
+                if isinstance(embed_copy["image"], str):
+                    embed_copy["image"] = {"url": embed_copy["image"]}
+                elif isinstance(embed_copy["image"], dict) and "url" not in embed_copy["image"]:
+                    embed_copy.pop("image")
+
+            # Remove empty fields
             for key in list(embed_copy.keys()):
                 if embed_copy[key] is None:
                     del embed_copy[key]
 
+            embed_copy = await resolve_embed_mentions(embed_copy, bot.get_guild(DESTINATION_SERVER_ID), message_data)
             cleaned_embeds.append(embed_copy)
+
         except Exception as e:
             logging.warning(f"❌ Embed processing failed: {e}")
 
@@ -394,20 +479,34 @@ async def send_to_webhook(message_data):
         for part in parts:
             for attempt in range(3):
                 try:
+                    avatar_url = message_data.get("author_avatar")
+
                     payload = {
                         "username": message_data.get("author_name", "Unknown"),
-                        "avatar_url": message_data.get("author_avatar"),
-                        "content": part if part else None
+                        "avatar_url": avatar_url
                     }
+
+                    if content:
+                        payload["content"] = content
+
+                    if embeds:
+                        payload["embeds"] = embeds
+
+                    if "embeds" in payload:
+                        logging.info(f"📤 Embeds included in payload: {json.dumps(payload['embeds'], indent=2)}")
+                    else:
+                        logging.warning("⚠️ Embeds were NOT included in final payload")
+
+                    if files:
+                        logging.info(f"📤 With files: {[f['filename'] for f in files]}")
 
                     if not payload.get("content"):
                         payload.pop("content", None)
 
-                    if part == parts[0] and cleaned_embeds and not files:
+                    if part == parts[0] and cleaned_embeds:
                         payload["embeds"] = cleaned_embeds
-
-                    elif "embeds" in payload:
-                        payload.pop("embeds", None)  # prevent empty embeds from being sent
+                    else:
+                        payload.pop("embeds", None)
 
                     # If message only has image attachments, treat as file upload instead of just an embed
                     if not content.strip() and not cleaned_embeds and files:
@@ -427,9 +526,11 @@ async def send_to_webhook(message_data):
 
                         async with session.post(webhook_url, data=form) as response:
                             if response.status in (200, 204):
-                                break
+                                logging.info(f"✅ Webhook message sent successfully to {webhook_url}")
+                                break  # only break on success
                             elif response.status == 404:
                                 error_text = await response.text()
+                                logging.error(f"❌ Webhook 404: {error_text}")
                                 if "Unknown Webhook" in error_text:
                                     logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Removing from config.")
                                     WEBHOOKS.pop(webhook_key, None)
@@ -453,7 +554,6 @@ async def send_to_webhook(message_data):
                                 error = await response.text()
                                 logging.error(f"❌ Webhook file upload failed ({response.status}) → {error}")
                                 return
-                        continue  # 🛑 Skip next block since file was already sent
 
                     # Fallback: JSON post without file
                     async with session.post(webhook_url, json=payload) as response:
@@ -655,7 +755,11 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
     # Check if this should go to a forum
     mapped_forum_name = forum_mappings.get(full_key)
     if mapped_forum_name:
-        forum_channel = discord.utils.get(guild.forum_channels, name=mapped_forum_name)
+        forum_channel = discord.utils.get(
+            guild.channels,
+            name=mapped_forum_name,
+            type=discord.ChannelType.forum
+        )
         if forum_channel:
             try:
                 msg = await forum_channel.send(content="Auto-archived from original channel")
@@ -769,6 +873,65 @@ async def update(ctx, *, description):
 
     await channel.send(embed=embed)
     await ctx.send("✅ Update posted.")
+
+@bot.event
+async def on_guild_channel_create(channel):
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    name = channel.name.lower()
+
+    # Month-based reroute to forum (e.g. april-16th-...)
+    months = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december"
+    ]
+    if any(name.startswith(month) for month in months):
+        forum = discord.utils.get(
+            channel.guild.channels,
+            name="📁│archived-guides",
+            type=discord.ChannelType.forum
+        )
+        if forum:
+            try:
+                msg = await forum.send("Auto-thread creation")
+                thread = await forum.create_thread(name=channel.name, message=msg, reason="Month-based reroute")
+                await channel.delete(reason="Moved to thread")
+                logging.info(f"📂 Routed '{channel.name}' to thread in '{forum.name}'")
+            except Exception as e:
+                logging.error(f"❌ Failed to move '{channel.name}' to forum: {e}")
+        return
+
+    # Time-based reroute (e.g. 11am-, 9pm-est-)
+    if re.match(r"^\d{1,2}(am|pm)(-est)?[-_]", name):
+        for cat in channel.guild.categories:
+            if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
+                try:
+                    await channel.edit(category=cat)
+                    logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
+                    break
+                except Exception as e:
+                    logging.error(f"❌ Failed to route '{channel.name}' to Daily Schedule: {e}")
+                    break
+        else:
+            logging.warning(f"⚠️ Could not find matching '📅 Daily Schedule [Server]' category for '{channel.name}'")
+        return
+
+    # Date-based reroute (e.g. 04-17│...)
+    if re.match(r"^\d{2}-\d{2}\│", name):
+        for cat in channel.guild.categories:
+            if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
+                try:
+                    await channel.edit(category=cat)
+                    logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
+                    break
+                except Exception as e:
+                    logging.error(f"❌ Failed to route '{channel.name}' to Release Guides: {e}")
+                    break
+        else:
+            logging.warning(f"⚠️ Could not find a matching '📅 Release Guides [Server]' category for '{channel.name}'")
+        return
+
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

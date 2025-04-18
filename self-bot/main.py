@@ -93,6 +93,18 @@ class MirrorSelfBot(discord.Client):
         logging.info(f"🔄 Connection resumed with Discord at {datetime.utcnow().isoformat()}")
 
     async def on_message(self, message):
+        # DEBUG FULL MESSAGE SNAPSHOT
+        try:
+            logging.info(f"📩 [DEBUG] MESSAGE RECEIVED — ID: {message.id}")
+            logging.info(f"↪ Server: {message.guild.name} ({message.guild.id})")
+            logging.info(f"↪ Channel: {message.channel.name} ({message.channel.id})")
+            logging.info(f"↪ Author: {message.author.display_name} ({message.author.id})")
+            logging.info(f"↪ Content: {message.content}")
+            logging.info(f"↪ Attachments: {[a.url for a in message.attachments]}")
+            logging.info(f"↪ Embeds: {[e.to_dict() for e in message.embeds]}")
+        except Exception as e:
+            logging.error(f"❌ Failed full message debug: {e}")
+
         await asyncio.sleep(0.5)  # Small delay to let Discord register attachments
         """Process messages and ensure they belong to monitored servers."""
         if not message.guild:
@@ -126,9 +138,6 @@ class MirrorSelfBot(discord.Client):
 
         if message.channel.id in excluded_channels:
             return
-
-        if not message.content and not message.attachments:
-            return  # 🛑 Skip empty messages without content or attachments
 
         logging.info(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
 
@@ -167,9 +176,19 @@ class MirrorSelfBot(discord.Client):
                 [{"image": {"url": message.attachments[0].url}}] if message.attachments else []
             ),
         }
+        log_preview = {
+            "server": message.guild.name,
+            "channel": message.channel.name,
+            "author": str(message.author),
+            "content": message.content,
+            "attachments": [a.url for a in message.attachments],
+            "embeds": [e.to_dict() for e in message.embeds]
+        }
+        logging.info(f"📤 Outgoing message data:\n{json.dumps(log_preview, indent=2)}")
 
         try:
             redis_client.lpush("message_queue", json.dumps(message_data))
+            logging.info(f"✅ QUEUED to Redis: message_id={message.id}")
             log_message(f"📩 Pushed message from {message.author} in #{message.channel.name} to Redis.")
         except Exception as e:
             print(f"❌ ERROR: Failed to push message to Redis: {e}")

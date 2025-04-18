@@ -265,7 +265,7 @@ async def clean_mentions(content: str, destination_guild: discord.Guild, message
     for user_id in user_mentions:
         try:
             user_obj = await bot.fetch_user(int(user_id))
-            tag = f"@{user_obj.name}#{user_obj.discriminator}"
+            tag = f"<@{user_obj.id}>"
             content = re.sub(f"<@!?{user_id}>", tag, content)
         except Exception:
             content = content.replace(f"<@{user_id}>", "@unknown")
@@ -324,8 +324,10 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
 
     # Handle <@&role_id>
     for match in re.findall(r"<@&(\d+)>", description):
-        role_name = message_data.get("mentioned_roles", {}).get(match, f"AutoRole-{match}")
-        role = discord.utils.get(guild.roles, name=role_name)
+        role_name = message_data.get("mentioned_roles", {}).get(match)
+        if not role_name:
+            role_name = f"role-{match}"
+        role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
         if not role:
             base = discord.utils.get(guild.roles, name="MEMBERS")
             if base:

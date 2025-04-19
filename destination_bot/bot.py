@@ -327,7 +327,11 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
     for match in re.findall(r"<@&(\d+)>", description):
         role_name = message_data.get("mentioned_roles", {}).get(match)
         if not role_name:
-            role_name = f"role-{match}"
+            # fallback, do not create with just an ID
+            logging.warning(f"⚠️ Missing role_name for ID {match}, skipping role replacement.")
+            continue
+
+        # Try case-insensitive match
         role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
         if not role:
             base = discord.utils.get(guild.roles, name="MEMBERS")

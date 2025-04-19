@@ -387,9 +387,10 @@ async def send_to_webhook(message_data):
     if forwarded_text:
         content = f"{forwarded_text}\n{content}"
 
-    reply_text = f"> **Replying to @{message_data['reply_to']}**" if message_data.get("reply_to") else ""
-    if reply_text:
-        content = f"{reply_text}\n{content}"
+    if message_data.get("reply_to") and message_data.get("reply_text"):
+        content = f"> **Replying to @{message_data['reply_to']}:** {message_data['reply_text']}\n{content}"
+    elif message_data.get("reply_to"):
+        content = f"> **Replying to @{message_data['reply_to']}**\n{content}"
 
     attachments = message_data.get("attachments", [])
     embeds = message_data.get("embeds", [])

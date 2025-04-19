@@ -141,8 +141,17 @@ class MirrorSelfBot(discord.Client):
                 if hasattr(message.reference.resolved.author, "nick") else str(
                 message.reference.resolved.author).replace("#0", "")
 
+        if message.reference and isinstance(message.reference.resolved, discord.Message):
+            original_msg = message.reference.resolved
+            reply_to = original_msg.author.display_name
+            reply_text = original_msg.clean_content[:180]  # clip to 180 chars
+        else:
+            reply_to = None
+            reply_text = None
+
         message_data = {
             "reply_to": reply_to,
+            "reply_text": reply_text,
             "channel_real_name": message.channel.name,
             "server_real_name": server.name,
             "mentioned_roles": role_mentions,

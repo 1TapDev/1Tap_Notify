@@ -162,7 +162,8 @@ async def monitor_for_archive():
                 try:
                     messages = [message async for message in channel.history(limit=50)]
                     for msg in messages:
-                        if "!archive" in msg.content.lower():
+                        content_lower = msg.content.lower()
+                        if "!archive" in content_lower or "archived to forum thread" in content_lower:
                             logging.info(f"🗑️ Archive command detected in '{channel.name}' → Message: {msg.content}")
 
                             server_name_raw = guild.name
@@ -600,6 +601,7 @@ class DestinationBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.webhook_cache = WEBHOOKS
         self.event(self.on_ready)
+        self.event(self.on_guild_channel_create)
 
     async def on_ready(self):
         print(f"✅ Bot {self.user} is running!")

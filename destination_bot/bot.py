@@ -784,7 +784,7 @@ class DestinationBot(commands.Bot):
             return
 
         # Time-based reroute (e.g. 11am-, 9pm-est-)
-        if re.match(r"^\d{1,2}(am|pm)(-est)?[-_]", name):
+        if re.search(r"\b\d{1,2}(am|pm)(-est)?[-_]", name):
             for cat in channel.guild.categories:
                 if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
                     try:
@@ -799,7 +799,7 @@ class DestinationBot(commands.Bot):
             return
 
         # Date-based reroute (e.g. 04-17│...)
-        if re.match(r"^\d{2}-\d{2}\│", name):
+        if re.search(r"^\d{2}-\d{2}\│", name):
             for cat in channel.guild.categories:
                 if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
                     try:

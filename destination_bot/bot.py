@@ -307,12 +307,26 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
 
     # Handle <#channel_id>
     for match in re.findall(r"<#(\d+)>", description):
-        original_channel_name = message_data.get("channel_real_name", "")
-        server_name = message_data.get("server_real_name", "").lower().replace(" ", "-")
-        expected_name = f"{original_channel_name} [{server_name}]"
-        channel = discord.utils.get(guild.text_channels, name=expected_name)
-        replacement = f"<#{channel.id}>" if channel else f"`{server_name} > #{original_channel_name}`"
-        description = description.replace(f"<#{match}>", replacement)
+        # Try to fetch the original channel name from Redis or database if needed
+        original_channel = bot.get_channel(int(match))
+        original_name = original_channel.name if original_channel else f"channel-{match}"
+        server_name = message_data.get("server_real_name", "Unknown Server")
+
+        # Try to match by normalized name in destination server
+        possible_matches = [
+            f"{original_name} [{server_name.lower().replace(' ', '-')}]",  # e.g., cards-chat [polar chefs]
+            original_name
+        ]
+
+        dest_channel = discord.utils.find(
+            lambda c: c.name in possible_matches,
+            guild.text_channels
+        )
+
+        if dest_channel:
+            description = description.replace(f"<#{match}>", f"<#{dest_channel.id}>")
+        else:
+            description = description.replace(f"<#{match}>", f"`{server_name} > #{original_name}`")
 
     # Handle <@user_id>
     for match in re.findall(r"<@!?(\d+)>", description):

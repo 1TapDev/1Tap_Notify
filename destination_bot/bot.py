@@ -364,15 +364,16 @@ async def send_to_webhook(message_data):
     message_id = message_data.get("message_id")
     # Auto-delete if archive command detected
     archive_trigger = message_data.get("content", "").strip().lower()
-    if archive_trigger in ["!archive", "channel archive"]:
+    if archive_trigger in ["!archive", "channel archive"] or "archived to forum thread" in archive_trigger:
         channel_obj = bot.get_channel(int(message_data["channel_id"]))
         if channel_obj:
             try:
-                await channel_obj.delete(reason="Triggered by archive command")
-                logging.info(f"🗑️ Deleted channel '{channel_obj.name}' due to archive trigger")
+                await channel_obj.delete(reason="Triggered by archive command or forum archive message")
+                logging.info(f"🗑️ Deleted channel '{channel_obj.name}' (ID: {channel_obj.id})")
             except Exception as e:
-                logging.error(f"❌ Failed to delete channel '{channel_obj.id}': {e}")
-        return
+                logging.error(f"❌ Failed to delete channel '{channel_obj.name}': {e}")
+        else:
+            logging.warning(f"⚠️ Channel not found in cache for archive delete: {message_data['channel_id']}")
 
     if message_id in recent_message_ids:
         return

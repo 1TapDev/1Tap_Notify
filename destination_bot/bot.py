@@ -735,6 +735,63 @@ class DestinationBot(commands.Bot):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
 
+    async def on_guild_channel_create(self, channel):
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        name = channel.name.lower()
+
+        # Month-based reroute to forum (e.g. april-16th-...)
+        months = [
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december"
+        ]
+        if any(name.startswith(month) for month in months):
+            forum = discord.utils.get(
+                channel.guild.channels,
+                name="📁│archived-guides",
+                type=discord.ChannelType.forum
+            )
+            if forum:
+                try:
+                    msg = await forum.send("Auto-thread creation")
+                    thread = await forum.create_thread(name=channel.name, message=msg, reason="Month-based reroute")
+                    await channel.delete(reason="Moved to thread")
+                    logging.info(f"📂 Routed '{channel.name}' to thread in '{forum.name}'")
+                except Exception as e:
+                    logging.error(f"❌ Failed to move '{channel.name}' to forum: {e}")
+            return
+
+        # Time-based reroute (e.g. 11am-, 9pm-est-)
+        if re.match(r"^\d{1,2}(am|pm)(-est)?[-_]", name):
+            for cat in channel.guild.categories:
+                if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
+                    try:
+                        await channel.edit(category=cat)
+                        logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
+                        break
+                    except Exception as e:
+                        logging.error(f"❌ Failed to route '{channel.name}' to Daily Schedule: {e}")
+                        break
+            else:
+                logging.warning(f"⚠️ Could not find matching '📅 Daily Schedule [Server]' category for '{channel.name}'")
+            return
+
+        # Date-based reroute (e.g. 04-17│...)
+        if re.match(r"^\d{2}-\d{2}\│", name):
+            for cat in channel.guild.categories:
+                if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
+                    try:
+                        await channel.edit(category=cat)
+                        logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
+                        break
+                    except Exception as e:
+                        logging.error(f"❌ Failed to route '{channel.name}' to Release Guides: {e}")
+                        break
+            else:
+                logging.warning(f"⚠️ Could not find a matching '📅 Release Guides [Server]' category for '{channel.name}'")
+            return
+
 async def create_channel_and_webhook(category_name, channel_name, server_name):
     guild = bot.get_guild(DESTINATION_SERVER_ID)
     if not guild:
@@ -875,65 +932,6 @@ async def update(ctx, *, description):
 
     await channel.send(embed=embed)
     await ctx.send("✅ Update posted.")
-
-@bot.event
-async def on_guild_channel_create(channel):
-    if not isinstance(channel, discord.TextChannel):
-        return
-
-    name = channel.name.lower()
-
-    # Month-based reroute to forum (e.g. april-16th-...)
-    months = [
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december"
-    ]
-    if any(name.startswith(month) for month in months):
-        forum = discord.utils.get(
-            channel.guild.channels,
-            name="📁│archived-guides",
-            type=discord.ChannelType.forum
-        )
-        if forum:
-            try:
-                msg = await forum.send("Auto-thread creation")
-                thread = await forum.create_thread(name=channel.name, message=msg, reason="Month-based reroute")
-                await channel.delete(reason="Moved to thread")
-                logging.info(f"📂 Routed '{channel.name}' to thread in '{forum.name}'")
-            except Exception as e:
-                logging.error(f"❌ Failed to move '{channel.name}' to forum: {e}")
-        return
-
-    # Time-based reroute (e.g. 11am-, 9pm-est-)
-    if re.match(r"^\d{1,2}(am|pm)(-est)?[-_]", name):
-        for cat in channel.guild.categories:
-            if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
-                try:
-                    await channel.edit(category=cat)
-                    logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
-                    break
-                except Exception as e:
-                    logging.error(f"❌ Failed to route '{channel.name}' to Daily Schedule: {e}")
-                    break
-        else:
-            logging.warning(f"⚠️ Could not find matching '📅 Daily Schedule [Server]' category for '{channel.name}'")
-        return
-
-    # Date-based reroute (e.g. 04-17│...)
-    if re.match(r"^\d{2}-\d{2}\│", name):
-        for cat in channel.guild.categories:
-            if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
-                try:
-                    await channel.edit(category=cat)
-                    logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
-                    break
-                except Exception as e:
-                    logging.error(f"❌ Failed to route '{channel.name}' to Release Guides: {e}")
-                    break
-        else:
-            logging.warning(f"⚠️ Could not find a matching '📅 Release Guides [Server]' category for '{channel.name}'")
-        return
-
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

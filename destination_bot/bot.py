@@ -778,10 +778,16 @@ class DestinationBot(commands.Bot):
                 try:
                     msg = await forum.send("Auto-thread creation")
                     thread = await forum.create_thread(name=channel.name, message=msg, reason="Month-based reroute")
-                    await channel.delete(reason="Moved to thread")
                     logging.info(f"📂 Routed '{channel.name}' to thread in '{forum.name}'")
                 except Exception as e:
                     logging.error(f"❌ Failed to move '{channel.name}' to forum: {e}")
+
+            # ✅ Always attempt to delete the channel, even if forum reroute fails
+            try:
+                await channel.delete(reason="Month-based reroute fallback")
+                logging.info(f"🗑️ Deleted channel '{channel.name}' after failed forum reroute.")
+            except Exception as e:
+                logging.error(f"❌ Failed to delete month-based channel '{channel.name}': {e}")
             return
 
         # Time-based reroute (e.g. 11am-, 9pm-est-)

@@ -362,9 +362,17 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
 
 async def send_to_webhook(message_data):
     message_id = message_data.get("message_id")
+
     # Auto-delete if archive command detected
     archive_trigger = message_data.get("content", "").strip().lower()
-    if archive_trigger in ["!archive", "channel archive"] or "archived to forum thread" in archive_trigger:
+    embed_title = (message_data.get("embed_title") or "").lower()
+    embed_desc = (message_data.get("embed_description") or "").lower()
+
+    if archive_trigger in ["!archive", "channel archive"] \
+            or "archived to forum thread" in archive_trigger \
+            or "channel archive" in embed_title \
+            or "channel archive" in embed_desc:
+
         channel_obj = bot.get_channel(int(message_data["channel_id"]))
         if channel_obj:
             try:
@@ -620,7 +628,6 @@ class DestinationBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.webhook_cache = WEBHOOKS
         self.event(self.on_ready)
-        self.event(self.on_guild_channel_create)
 
     async def on_ready(self):
         print(f"✅ Bot {self.user} is running!")
@@ -632,6 +639,8 @@ class DestinationBot(commands.Bot):
         print("✅ Webhook setup complete. Bot is now processing messages.")
         asyncio.create_task(process_redis_messages())
         asyncio.create_task(monitor_for_archive())
+        asyncio.create_task(self.monitor_channels_continuously())
+        asyncio.create_task(self.monitor_deleted_channels())
 
     async def migrate_channels_to_uncategorized(self):
         guild = self.get_guild(DESTINATION_SERVER_ID)
@@ -757,68 +766,161 @@ class DestinationBot(commands.Bot):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
 
-    async def on_guild_channel_create(self, channel):
-        if not isinstance(channel, discord.TextChannel):
-            return
+    async def monitor_channels_continuously(self):
+        await self.wait_until_ready()
+        guild = self.get_guild(DESTINATION_SERVER_ID)
 
-        name = channel.name.lower()
-
-        # Month-based reroute to forum (e.g. april-16th-...)
         months = [
             "january", "february", "march", "april", "may", "june",
             "july", "august", "september", "october", "november", "december"
         ]
-        if any(name.startswith(month) for month in months):
-            forum = discord.utils.get(
-                channel.guild.channels,
-                name="📁│archived-guides",
-                type=discord.ChannelType.forum
-            )
-            if forum:
-                try:
-                    msg = await forum.send("Auto-thread creation")
-                    thread = await forum.create_thread(name=channel.name, message=msg, reason="Month-based reroute")
-                    logging.info(f"📂 Routed '{channel.name}' to thread in '{forum.name}'")
-                except Exception as e:
-                    logging.error(f"❌ Failed to move '{channel.name}' to forum: {e}")
 
-            # ✅ Always attempt to delete the channel, even if forum reroute fails
+        while not self.is_closed():
             try:
-                await channel.delete(reason="Month-based reroute fallback")
-                logging.info(f"🗑️ Deleted channel '{channel.name}' after failed forum reroute.")
+                # 1. Sort channels in their categories
+                for category in guild.categories:
+                    if category.name.startswith("📅 Release Guides"):
+                        logging.info(f"📁 Found Release Guides category: '{category.name}'")
+                        await self.sort_channels_in_category(category, by="date")
+                    elif category.name.startswith("📅 Daily Schedule"):
+                        logging.info(f"📁 Found Daily Schedule category: '{category.name}'")
+                        await self.sort_channels_in_category(category, by="time")
+
+                # 2. Reroute uncategorized channels
+                for channel in guild.text_channels:
+                    name = channel.name.lower()
+                    if channel.category is not None:
+                        continue  # Skip already categorized channels
+
+                    # Delete divine+month
+                    if any(month in name for month in months) and "divine" in name:
+                        try:
+                            await channel.delete(reason="Month + divine based channel deleted")
+                            logging.info(f"🗑️ Deleted channel '{channel.name}' (divine/month match)")
+                            continue
+                        except Exception as e:
+                            logging.error(f"❌ Failed to delete '{channel.name}': {e}")
+
+                    # Time reroute
+                    if re.search(r"\b\d{1,2}(am|pm)\b", name):
+                        for cat in guild.categories:
+                            if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
+                                try:
+                                    await channel.edit(category=cat)
+                                    server_tag_match = re.search(r'\[(.*?)\]$', channel.name)
+                                    if server_tag_match:
+                                        server_tag = server_tag_match.group(1)
+                                        source_channel_id = config["source_channel_ids"].get(server_tag)
+                                        if source_channel_id:
+                                            redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
+                                    logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
+                                except Exception as e:
+                                    logging.error(f"❌ Could not move '{channel.name}' to Daily Schedule: {e}")
+                                break
+
+                    # Date reroute
+                    elif re.search(r"\b\d{1,2}-\d{1,2}\b", name):
+                        for cat in guild.categories:
+                            if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
+                                try:
+                                    await channel.edit(category=cat)
+                                    server_tag_match = re.search(r'\[(.*?)\]$', channel.name)
+                                    if server_tag_match:
+                                        server_tag = server_tag_match.group(1)
+                                        source_channel_id = config["source_channel_ids"].get(server_tag)
+                                        if source_channel_id:
+                                            redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
+                                    logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
+                                except Exception as e:
+                                    logging.error(f"❌ Could not move '{channel.name}' to Release Guides: {e}")
+                                break
+
             except Exception as e:
-                logging.error(f"❌ Failed to delete month-based channel '{channel.name}': {e}")
-            return
+                logging.error(f"❌ monitor_channels_continuously error: {e}")
 
-        # Time-based reroute (e.g. 11am-, 9pm-est-)
-        if re.search(r"\b\d{1,2}(am|pm)(-est)?[-_]", name):
-            for cat in channel.guild.categories:
-                if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
-                    try:
-                        await channel.edit(category=cat)
-                        logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
-                        break
-                    except Exception as e:
-                        logging.error(f"❌ Failed to route '{channel.name}' to Daily Schedule: {e}")
-                        break
-            else:
-                logging.warning(f"⚠️ Could not find matching '📅 Daily Schedule [Server]' category for '{channel.name}'")
-            return
+            await asyncio.sleep(10)
 
-        # Date-based reroute (e.g. 04-17│...)
-        if re.search(r"^\d{2}-\d{2}\│", name):
-            for cat in channel.guild.categories:
-                if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
-                    try:
-                        await channel.edit(category=cat)
-                        logging.info(f"📅 Routed '{channel.name}' to '{cat.name}'")
-                        break
-                    except Exception as e:
-                        logging.error(f"❌ Failed to route '{channel.name}' to Release Guides: {e}")
-                        break
-            else:
-                logging.warning(f"⚠️ Could not find a matching '📅 Release Guides [Server]' category for '{channel.name}'")
+    async def delete_channel_if_source_deleted(self, source_channel_id: int, destination_channel_id: int):
+        """Delete destination channel if the corresponding source channel no longer exists."""
+        try:
+            # Make an API call to Discord to check if the source channel still exists
+            session = aiohttp.ClientSession()
+            headers = {
+                "Authorization": f"Bot {BOT_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            url = f"https://discord.com/api/v10/channels/{source_channel_id}"
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    # Source channel was deleted
+                    logging.info(
+                        f"🗑️ Source channel {source_channel_id} not found, deleting destination channel {destination_channel_id}")
+                    dest_channel = self.get_channel(destination_channel_id)
+                    if dest_channel:
+                        await dest_channel.delete(reason="Source channel deleted")
+                    else:
+                        logging.warning(f"⚠️ Destination channel {destination_channel_id} not found for deletion")
+                elif response.status != 200:
+                    error_text = await response.text()
+                    logging.warning(
+                        f"⚠️ Unexpected status checking source channel {source_channel_id}: {response.status} {error_text}")
+        except Exception as e:
+            logging.error(f"❌ Error while checking/deleting destination channel: {e}")
+        finally:
+            await session.close()
+
+    async def monitor_deleted_channels(self):
+        await self.wait_until_ready()
+
+        while not self.is_closed():
+            try:
+                monitoring_map = redis_client.hgetall("channel_monitoring")
+
+                for destination_channel_id, source_channel_id in monitoring_map.items():
+                    dest_channel_id = int(destination_channel_id)
+                    source_chan_id = int(source_channel_id)
+                    await self.delete_channel_if_source_deleted(source_chan_id, dest_channel_id)
+
+            except Exception as e:
+                logging.error(f"❌ monitor_deleted_channels error: {e}")
+
+            await asyncio.sleep(10)
+
+    async def sort_channels_in_category(self, category, by="date"):
+        if category.name not in ["📅 Daily Schedule [1Tap Notify]", "📁 Release Guides [1Tap Notify]"]:
+            logging.info(f"⛔ Skipping category '{category.name}' — not eligible for sorting.")
             return
+        logging.info(f"🔃 Sorting '{category.name}' by {by} with {len(category.channels)} channels")
+
+        def extract_sort_key(name):
+            # Remove emojis and special characters
+            clean_name = re.sub(r'[^\w\s:-]', '', name.lower())
+            logging.info(f"🔎 Evaluating sort key for: {name} → cleaned: {clean_name}")
+
+            if by == "date":
+                # Match patterns like 4-17, 04-17, 4/17
+                match = re.search(r'\b(\d{1,2})[-/](\d{1,2})\b', clean_name)
+                if match:
+                    try:
+                        date_val = datetime.strptime(f"{match.group(1)}-{match.group(2)}", "%m-%d")
+                        logging.info(f"✅ Parsed date for '{name}': {date_val}")
+                        return date_val
+                    except Exception as e:
+                        logging.warning(f"⚠️ Failed to parse date for '{name}': {e}")
+
+            elif by == "time":
+                # Match 4pm, 11am, 5AM, etc.
+                match = re.search(r'\b(\d{1,2})(am|pm)\b', clean_name)
+                if match:
+                    try:
+                        time_val = datetime.strptime(match.group(0), "%I%p")
+                        logging.info(f"✅ Parsed time for '{name}': {time_val}")
+                        return time_val
+                    except Exception as e:
+                        logging.warning(f"⚠️ Failed to parse time for '{name}': {e}")
+
+            logging.info(f"🔽 No valid sort key found for: {name}, pushing to bottom")
+            return datetime.max
 
 async def create_channel_and_webhook(category_name, channel_name, server_name):
     guild = bot.get_guild(DESTINATION_SERVER_ID)
@@ -830,6 +932,7 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
     channel_name = channel_name.lower().replace(" ", "-").replace("|", "").strip()
     server_name = server_name.lower().replace(" ", "-").replace("|", "").strip()
     target_names = [
+        normalize_name(f"{channel_name} [{server_name}]").replace("-", " "),  # add this
         normalize_name(f"{channel_name} [{server_name}]"),
         normalize_name(f"{channel_name}-{server_name}"),
         normalize_name(f"{channel_name}_{server_name}"),
@@ -871,12 +974,12 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
         normalize_name(c.name) for c in guild.text_channels
     ]
     target_names = [
+        normalize_name(f"{channel_name} [{server_name}]").replace("-", " "),  # add this
         normalize_name(f"{channel_name} [{server_name}]"),
         normalize_name(f"{channel_name}-{server_name}"),
         normalize_name(f"{channel_name}_{server_name}"),
         normalize_name(f"{server_name}-{channel_name}"),
     ]
-
     existing_channel = discord.utils.find(
         lambda c: normalize_name(c.name) in target_names,
         guild.text_channels

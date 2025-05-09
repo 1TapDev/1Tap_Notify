@@ -8,6 +8,7 @@ import redis
 import hashlib
 import traceback
 import signal
+import re
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -92,6 +93,69 @@ class MirrorSelfBot(discord.Client):
     async def on_resumed(self):
         logging.info(f"🔄 Connection resumed with Discord at {datetime.utcnow().isoformat()}")
 
+    def is_time_or_date_based(self, name):
+        clean_name = re.sub(r'[^\w\s:-]', '', name.lower())
+
+        date_match = re.search(r'\b(\d{1,2})[-/](\d{1,2})\b', clean_name)
+        time_match = re.search(r'\b(\d{1,2})(am|pm)\b', clean_name)
+
+        return bool(date_match or time_match)
+
+    async def send_channel_delete(self, channel):
+        server_real_name = self.get_server_real_name(channel.guild)
+        channel_real_name = self.clean_channel_name(channel.name)
+
+        data = {
+            "action": "delete_channel",
+            "server_real_name": server_real_name,
+            "channel_real_name": channel_real_name
+        }
+        await self.send_to_destination(data)
+
+    async def monitor_deleted_channels(self):
+        await self.wait_until_ready()
+        logging.info("🛡️ Starting deleted channel monitor (only time/date based channels)")
+
+        # Build a dict to track monitored channels: {channel_id: channel_object}
+        monitored_channels = {}
+
+        # Initial population
+        for guild in self.guilds:
+            for channel in guild.text_channels:
+                if self.is_time_or_date_based(channel.name):
+                    monitored_channels[channel.id] = channel
+
+        while True:
+            try:
+                # Rebuild monitored_channels continuously
+                for guild in self.guilds:
+                    live_channels = await guild.fetch_channels()
+                    live_channel_ids = {c.id for c in live_channels if isinstance(c, discord.TextChannel)}
+
+                    # Add new channels if they match time/date format
+                    for channel in live_channels:
+                        if isinstance(channel, discord.TextChannel):
+                            if self.is_time_or_date_based(channel.name) and channel.id not in monitored_channels:
+                                monitored_channels[channel.id] = channel
+                                logging.info(
+                                    f"➕ Now monitoring new time/date channel: {channel.name} (ID: {channel.id})")
+
+                # Check if any monitored channel has been deleted
+                for channel_id, channel in list(monitored_channels.items()):
+                    guild = channel.guild
+                    live_channels = await guild.fetch_channels()
+                    live_channel_ids = {c.id for c in live_channels if isinstance(c, discord.TextChannel)}
+
+                    if channel_id not in live_channel_ids:
+                        logging.info(f"🗑️ Detected deletion of {channel.name} (ID {channel.id}). Notifying bot.py...")
+                        await self.send_channel_delete(channel)
+                        monitored_channels.pop(channel_id, None)
+
+            except Exception as e:
+                logging.error(f"⚠️ Error in monitor_deleted_channels: {e}")
+
+            await asyncio.sleep(10)  # Recheck every 10 seconds
+
     async def on_message(self, message):
         await asyncio.sleep(0.5)  # Small delay to let Discord register attachments
         """Process messages and ensure they belong to monitored servers."""
@@ -149,6 +213,20 @@ class MirrorSelfBot(discord.Client):
             reply_to = None
             reply_text = None
 
+        forwarded_from = None
+        forwarded_embeds = []
+
+        if (
+                not message.embeds
+                and not message.attachments
+                and message.reference
+                and isinstance(message.reference.resolved, discord.Message)
+        ):
+            ref_msg = message.reference.resolved
+            if ref_msg and ref_msg.embeds and ref_msg.author.bot:
+                forwarded_from = ref_msg.author.display_name or str(ref_msg.author)
+                forwarded_embeds = [self.format_embed(embed) for embed in ref_msg.embeds]
+
         message_data = {
             "reply_to": reply_to,
             "reply_text": reply_text,
@@ -167,6 +245,7 @@ class MirrorSelfBot(discord.Client):
             "author_avatar": message.author.avatar.url if message.author.avatar else None,
             "timestamp": str(message.created_at),
             "attachments": [attachment.url for attachment in message.attachments],
+            "forwarded_from": forwarded_from,
             "embeds": (
                 [self.format_embed(embed) for embed in message.embeds]
                 if message.embeds else
@@ -241,6 +320,7 @@ async def start_self_bots():
                     delay = min(delay * 2, 300)  # cap backoff at 5 minutes
 
         asyncio.create_task(try_start_bot(bot, token))
+        asyncio.create_task(bot.monitor_deleted_channels())
 
 def shutdown_handler(bot_instances):
     async def handler():

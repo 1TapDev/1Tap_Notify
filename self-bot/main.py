@@ -34,8 +34,10 @@ console_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s
 console_handler.setFormatter(console_formatter)
 logging.getLogger().addHandler(console_handler)
 
+
 def log_message(message):
     logging.info(message)  # No print
+
 
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0)
@@ -46,8 +48,18 @@ load_dotenv()
 # Load configuration
 CONFIG_FILE = "config.json"
 
-with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-    config = json.load(f)
+
+def load_config():
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_config(config_data):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, indent=4)
+
+
+config = load_config()
 
 TOKENS = config["tokens"]
 DESTINATION_SERVERS = config.get("destination_servers", {})
@@ -55,6 +67,10 @@ EXCLUDED_CATEGORIES = set(config.get("excluded_categories", []))  # Ensure valid
 WEBHOOKS = config.get("webhooks", {})
 MESSAGE_DELAY = config["settings"].get("message_delay", 0.75)  # Default to 0.75s delay
 DESTINATION_BOT_URL = "http://127.0.0.1:5000/process_message"  # Change if bot.py is remote
+MAX_LOGIN_ATTEMPTS = config["settings"].get("max_login_attempts", 3)  # Add this setting
+
+# Track failed tokens
+failed_tokens = set()
 
 
 def get_excluded_categories(server_id):
@@ -65,6 +81,7 @@ def get_excluded_categories(server_id):
 
     return set()  # Return an empty set if no excluded categories are found
 
+
 def get_excluded_channels(server_id):
     """Retrieve excluded channels for a given server from TOKENS data."""
     for token_data in TOKENS.values():
@@ -72,9 +89,35 @@ def get_excluded_channels(server_id):
             return set(token_data["servers"][server_id].get("excluded_channels", []))
     return set()
 
+
 def get_server_info(server_id):
     """Retrieve human-readable server name from config.json."""
     return DESTINATION_SERVERS.get(str(server_id), {}).get("info", f"Unknown Server ({server_id})")
+
+
+def save_user_info(token, user_info):
+    """Save user info to config for the given token."""
+    config = load_config()
+    if token in config["tokens"]:
+        config["tokens"][token]["user_info"] = {
+            "id": str(user_info.id),
+            "name": str(user_info),
+            "discriminator": user_info.discriminator if hasattr(user_info, 'discriminator') else "0",
+            "last_successful_login": datetime.now().isoformat()
+        }
+        save_config(config)
+        logging.info(f"✅ Saved user info for {user_info} to config")
+
+
+def mark_token_as_failed(token, error_message):
+    """Mark token as failed in config."""
+    config = load_config()
+    if token in config["tokens"]:
+        config["tokens"][token]["status"] = "failed"
+        config["tokens"][token]["last_error"] = error_message
+        config["tokens"][token]["last_failed_attempt"] = datetime.now().isoformat()
+        save_config(config)
+
 
 class MirrorSelfBot(discord.Client):
     def __init__(self, token, monitored_servers):
@@ -82,10 +125,18 @@ class MirrorSelfBot(discord.Client):
         self.token = token
         self.monitored_servers = {str(server_id) for server_id in monitored_servers}
         self.session = aiohttp.ClientSession()  # ✅ Initialize session here
+        self.login_attempts = 0
+        self.max_attempts = MAX_LOGIN_ATTEMPTS
 
     async def on_ready(self):
         await self.fetch_guilds()
         print(f"✅ Self-bot {self.user} is now monitoring servers: {self.monitored_servers}")
+
+        # Save user info on successful login
+        save_user_info(self.token, self.user)
+
+        # Reset login attempts on successful connection
+        self.login_attempts = 0
 
     async def on_disconnect(self):
         logging.warning(f"🔌 Disconnected from Discord at {datetime.utcnow().isoformat()}")
@@ -299,11 +350,21 @@ class MirrorSelfBot(discord.Client):
         if self.session:
             await self.session.close()  # Ensure session is properly closed
 
+
 async def start_self_bots():
     for token, token_data in TOKENS.items():
         if token_data.get("disabled", False):
             logging.warning(f"⛔ Token disabled: {token[:10]}... Skipping.")
             continue
+
+        # Skip if token has failed status
+        if token_data.get("status") == "failed":
+            user_info = token_data.get("user_info", {})
+            username = user_info.get("name", "Unknown User")
+            logging.warning(f"⛔ Token for {username} marked as failed: {token[:10]}... Skipping.")
+            print(f"⛔ Skipping failed token for user: {username}")
+            continue
+
         server_ids = set(token_data["servers"].keys())
         print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
 
@@ -311,16 +372,45 @@ async def start_self_bots():
 
         async def try_start_bot(bot_instance, token):
             delay = 5
-            while True:
+            attempts = 0
+            max_attempts = bot_instance.max_attempts
+
+            while attempts < max_attempts:
                 try:
+                    attempts += 1
+                    print(f"🔄 Login attempt {attempts}/{max_attempts} for token {token[:10]}...")
                     await bot_instance.start(token)
+                except discord.LoginFailure as e:
+                    error_msg = str(e)
+                    if "improper token" in error_msg.lower() or "401" in error_msg:
+                        print(f"❌ Invalid token detected: {token[:10]}... Stopping login attempts.")
+                        logging.error(f"❌ Invalid token: {token[:10]}... Error: {e}")
+                        mark_token_as_failed(token, error_msg)
+                        failed_tokens.add(token)
+
+                        # Try to get user info from config if available
+                        token_data = TOKENS.get(token, {})
+                        user_info = token_data.get("user_info", {})
+                        if user_info:
+                            print(f"ℹ️ This token belongs to user: {user_info.get('name', 'Unknown')}")
+                        else:
+                            print(f"ℹ️ No user info available for this token. Fix the token in config.json")
+                        break
                 except Exception as e:
-                    logging.error(f"❌ Bot crashed or disconnected. Reconnecting in {delay} seconds. Error: {e}")
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 300)  # cap backoff at 5 minutes
+                    logging.error(f"❌ Bot crashed (attempt {attempts}/{max_attempts}). Error: {e}")
+                    if attempts < max_attempts:
+                        print(f"⏳ Reconnecting in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 60)  # cap backoff at 60 seconds
+                    else:
+                        print(f"❌ Max login attempts reached for token {token[:10]}... Stopping.")
+                        mark_token_as_failed(token, f"Max attempts reached: {str(e)}")
+                        failed_tokens.add(token)
+                        break
 
         asyncio.create_task(try_start_bot(bot, token))
         asyncio.create_task(bot.monitor_deleted_channels())
+
 
 def shutdown_handler(bot_instances):
     async def handler():
@@ -329,34 +419,90 @@ def shutdown_handler(bot_instances):
             await bot.close()
         await asyncio.sleep(2)
         os._exit(0)
+
     return handler
+
 
 # Start listening for requests
 async def main():
     bot_instances = []
 
-    enabled_tokens = [(t, d) for t, d in TOKENS.items() if not d.get("disabled", False)]
+    # First, add the max_login_attempts setting if it doesn't exist
+    if "max_login_attempts" not in config.get("settings", {}):
+        config["settings"]["max_login_attempts"] = 3
+        save_config(config)
+
+    enabled_tokens = [(t, d) for t, d in TOKENS.items() if not d.get("disabled", False) and d.get("status") != "failed"]
+
+    if not enabled_tokens:
+        print("❌ No valid tokens found. Please check your config.json")
+        return
+
     for index, (token, token_data) in enumerate(enabled_tokens):
         server_ids = set(token_data["servers"].keys())
-        print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
+
+        # Show user info if available
+        user_info = token_data.get("user_info", {})
+        if user_info:
+            print(
+                f"🔹 Loading bot for user {user_info.get('name', 'Unknown')} with token {token[:10]}... Monitoring servers: {server_ids}")
+        else:
+            print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
+
         bot = MirrorSelfBot(token, server_ids)
         bot_instances.append(bot)
 
         async def try_start_bot(bot_instance, token):
             delay = 5
-            while True:
+            attempts = 0
+            max_attempts = bot_instance.max_attempts
+
+            while attempts < max_attempts:
                 try:
+                    attempts += 1
+                    print(f"🔄 Login attempt {attempts}/{max_attempts} for token {token[:10]}...")
                     await bot_instance.start(token)
+                except discord.LoginFailure as e:
+                    error_msg = str(e)
+                    if "improper token" in error_msg.lower() or "401" in error_msg:
+                        print(f"❌ Invalid token detected: {token[:10]}... Stopping login attempts.")
+                        logging.error(f"❌ Invalid token: {token[:10]}... Error: {e}")
+                        mark_token_as_failed(token, error_msg)
+
+                        # Try to get user info from config if available
+                        token_data = TOKENS.get(token, {})
+                        user_info = token_data.get("user_info", {})
+                        if user_info:
+                            print(f"ℹ️ This token belongs to user: {user_info.get('name', 'Unknown')}")
+                        else:
+                            print(f"ℹ️ No user info available for this token. Fix the token in config.json")
+                        break
                 except Exception as e:
-                    logging.error(f"❌ Bot crashed or disconnected. Reconnecting in {delay} seconds. Error: {e}")
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 300)
+                    logging.error(f"❌ Bot crashed (attempt {attempts}/{max_attempts}). Error: {e}")
+                    if attempts < max_attempts:
+                        print(f"⏳ Reconnecting in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 60)
+                    else:
+                        print(f"❌ Max login attempts reached for token {token[:10]}... Stopping.")
+                        mark_token_as_failed(token, f"Max attempts reached: {str(e)}")
+                        break
 
         # ⏳ Stagger bot launches by 5 seconds each
         await asyncio.sleep(index * 5)
         asyncio.create_task(try_start_bot(bot, token))
 
     print("⏳ Waiting for self-bots to finish login...")
+
+    # Show summary of failed tokens at the end
+    if failed_tokens:
+        print("\n⚠️ Summary of failed tokens:")
+        for token in failed_tokens:
+            token_data = TOKENS.get(token, {})
+            user_info = token_data.get("user_info", {})
+            username = user_info.get("name", "Unknown User")
+            print(f"  - Token {token[:10]}... for user: {username}")
+        print("\nPlease update these tokens in config.json\n")
 
     try:
         while True:

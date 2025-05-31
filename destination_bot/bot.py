@@ -14,7 +14,7 @@ import re
 from discord.ext import commands
 from discord.ext import tasks
 from aiohttp import web
-from datetime import datetime
+from datetime import datetime, timedelta
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--queue", default="message_queue", help="Redis queue name")
@@ -60,6 +60,7 @@ redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=T
 # Global cache to track recent message_ids and prevent duplicates
 recent_message_ids = set()
 
+
 def get_next_version():
     version_file = "version.txt"
     if not os.path.exists(version_file):
@@ -81,6 +82,7 @@ def get_next_version():
         f.write(next_version)
 
     return next_version
+
 
 def cleanup_dead_webhooks():
     logging.info("🧹 Starting cleanup of dead webhooks...")
@@ -114,20 +116,25 @@ def cleanup_dead_webhooks():
     else:
         logging.info("✅ Cleanup completed — no dead webhooks found.")
 
+
 def strip_emojis(text):
     return re.sub(r'[^\w\s\[\]-]', '', text).strip()
+
 
 def schedule_cleanup():
     while True:
         cleanup_dead_webhooks()
         time.sleep(1800)
 
+
 def normalize_category(name):
     name = re.sub(r"[^\w\s\[\]\-()]", "", name)
     return name.lower().replace("  ", " ").strip()
 
+
 def normalize_server_tag(tag):
     return tag.lower().strip()
+
 
 def normalize_key(category_name, channel_name, server_name):
     norm_category = category_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").replace("⚡", "").strip()
@@ -135,18 +142,20 @@ def normalize_key(category_name, channel_name, server_name):
     norm_server = server_name.lower().replace(" ", "-").replace("|", "").replace("︱", "").strip()
     return f"{norm_category}-[{norm_server}]/{norm_channel}"
 
+
 def normalize_name(name: str) -> str:
     return (
         name.lower()
         .replace("–", "-")  # En dash
         .replace("—", "-")  # Em dash
         .replace("‒", "-")  # Figure dash
-        .replace("‘", "'")
-        .replace("’", "'")
-        .replace("“", '"')
-        .replace("”", '"')
+        .replace("'", "'")
+        .replace("'", "'")
+        .replace(""", '"')
+        .replace(""", '"')
         .strip()
     )
+
 
 async def monitor_for_archive():
     await bot.wait_until_ready()
@@ -209,6 +218,7 @@ async def monitor_for_archive():
             logging.error(f"❌ monitor_for_archive loop error: {e}")
             await asyncio.sleep(5)
 
+
 async def process_redis_messages():
     try:
         while True:
@@ -244,7 +254,6 @@ async def process_redis_messages():
 
 
 async def clean_mentions(content: str, destination_guild: discord.Guild, message_data: dict) -> str:
-
     # Replace <#channel_id> with destination channel or fallback text
     channel_mentions = re.findall(r"<#(\d+)>", content)
     for channel_id in channel_mentions:
@@ -298,6 +307,7 @@ async def clean_mentions(content: str, destination_guild: discord.Guild, message
         content = content.replace(f"<@&{role_id}>", f"<@&{dest_role.id}>")
 
     return content
+
 
 async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data: dict) -> dict:
     """Fix mentions inside embed fields like <#id>, <@id>, <@&id>."""
@@ -617,6 +627,7 @@ async def send_to_webhook(message_data):
                     logging.error(f"❌ Exception during webhook post: {e}")
                     await asyncio.sleep(2 * (attempt + 1))
 
+
 class DestinationBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -641,6 +652,7 @@ class DestinationBot(commands.Bot):
         asyncio.create_task(monitor_for_archive())
         asyncio.create_task(self.monitor_channels_continuously())
         asyncio.create_task(self.monitor_deleted_channels())
+        asyncio.create_task(self.cleanup_expired_channels())
 
     async def migrate_channels_to_uncategorized(self):
         guild = self.get_guild(DESTINATION_SERVER_ID)
@@ -766,6 +778,101 @@ class DestinationBot(commands.Bot):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
 
+    async def cleanup_expired_channels(self):
+        """Check and delete expired channels in Daily Schedule and Release Guides categories."""
+        await self.wait_until_ready()
+        guild = self.get_guild(DESTINATION_SERVER_ID)
+
+        while not self.is_closed():
+            try:
+                current_time = datetime.now()
+                current_year = current_time.year
+
+                for category in guild.categories:
+                    # Daily Schedule - 24 hour expiration
+                    if category.name.startswith("📅 Daily Schedule"):
+                        for channel in category.channels:
+                            if not isinstance(channel, discord.TextChannel):
+                                continue
+
+                            # Store creation time when channel is first seen
+                            creation_key = f"channel_created_{channel.id}"
+                            stored_time = redis_client.get(creation_key)
+
+                            if not stored_time:
+                                # First time seeing this channel, store its creation time
+                                redis_client.setex(creation_key, 86400 * 2,
+                                                   current_time.isoformat())  # Store for 48 hours
+                                logging.info(f"📅 Tracking new daily channel: {channel.name}")
+                            else:
+                                # Check if 24 hours have passed
+                                created_time = datetime.fromisoformat(stored_time)
+                                time_elapsed = current_time - created_time
+
+                                if time_elapsed >= timedelta(hours=24):
+                                    try:
+                                        await channel.delete(reason="Daily Schedule channel expired (24 hours)")
+                                        redis_client.delete(creation_key)
+                                        logging.info(
+                                            f"🗑️ Deleted expired daily channel: {channel.name} (age: {time_elapsed})")
+                                    except Exception as e:
+                                        logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
+
+                    # Release Guides - 7 days expiration or past date
+                    elif category.name.startswith("📅 Release Guides"):
+                        for channel in category.channels:
+                            if not isinstance(channel, discord.TextChannel):
+                                continue
+
+                            clean_name = re.sub(r'[^\w\s:-]', '', channel.name.lower())
+
+                            # Check if channel has a date
+                            date_match = re.search(r'\b(\d{1,2})[-/](\d{1,2})\b', clean_name)
+                            if date_match:
+                                try:
+                                    # Parse the date (assume current year)
+                                    month = int(date_match.group(1))
+                                    day = int(date_match.group(2))
+                                    channel_date = datetime(current_year, month, day)
+
+                                    # If the date is in the past, delete immediately
+                                    if channel_date.date() < current_time.date():
+                                        await channel.delete(
+                                            reason=f"Release Guide channel date has passed ({month}/{day})")
+                                        logging.info(f"🗑️ Deleted past-date release channel: {channel.name}")
+                                        continue
+                                except ValueError:
+                                    logging.warning(f"⚠️ Invalid date format in channel: {channel.name}")
+
+                            # Check 7-day expiration
+                            creation_key = f"channel_created_{channel.id}"
+                            stored_time = redis_client.get(creation_key)
+
+                            if not stored_time:
+                                # First time seeing this channel, store its creation time
+                                redis_client.setex(creation_key, 86400 * 14,
+                                                   current_time.isoformat())  # Store for 14 days
+                                logging.info(f"📅 Tracking new release channel: {channel.name}")
+                            else:
+                                # Check if 7 days have passed
+                                created_time = datetime.fromisoformat(stored_time)
+                                time_elapsed = current_time - created_time
+
+                                if time_elapsed >= timedelta(days=7):
+                                    try:
+                                        await channel.delete(reason="Release Guide channel expired (7 days)")
+                                        redis_client.delete(creation_key)
+                                        logging.info(
+                                            f"🗑️ Deleted expired release channel: {channel.name} (age: {time_elapsed})")
+                                    except Exception as e:
+                                        logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
+
+            except Exception as e:
+                logging.error(f"❌ cleanup_expired_channels error: {e}")
+
+            # Check every 30 minutes
+            await asyncio.sleep(1800)
+
     async def monitor_channels_continuously(self):
         await self.wait_until_ready()
         guild = self.get_guild(DESTINATION_SERVER_ID)
@@ -807,12 +914,12 @@ class DestinationBot(commands.Bot):
                             if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
                                 try:
                                     await channel.edit(category=cat)
-                                    server_tag_match = re.search(r'\[(.*?)\]$', channel.name)
+                                    server_tag_match = re.search(r'\[(.*?)\]', channel.name)
                                     if server_tag_match:
                                         server_tag = server_tag_match.group(1)
-                                        source_channel_id = config["source_channel_ids"].get(server_tag)
-                                        if source_channel_id:
-                                            redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
+                                    source_channel_id = config["source_channel_ids"].get(server_tag)
+                                    if source_channel_id:
+                                        redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
                                     logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
                                 except Exception as e:
                                     logging.error(f"❌ Could not move '{channel.name}' to Daily Schedule: {e}")
@@ -824,12 +931,12 @@ class DestinationBot(commands.Bot):
                             if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
                                 try:
                                     await channel.edit(category=cat)
-                                    server_tag_match = re.search(r'\[(.*?)\]$', channel.name)
+                                    server_tag_match = re.search(r'\[(.*?)\]', channel.name)
                                     if server_tag_match:
                                         server_tag = server_tag_match.group(1)
-                                        source_channel_id = config["source_channel_ids"].get(server_tag)
-                                        if source_channel_id:
-                                            redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
+                                    source_channel_id = config["source_channel_ids"].get(server_tag)
+                                    if source_channel_id:
+                                        redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
                                     logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
                                 except Exception as e:
                                     logging.error(f"❌ Could not move '{channel.name}' to Release Guides: {e}")
@@ -922,6 +1029,7 @@ class DestinationBot(commands.Bot):
             logging.info(f"🔽 No valid sort key found for: {name}, pushing to bottom")
             return datetime.max
 
+
 async def create_channel_and_webhook(category_name, channel_name, server_name):
     guild = bot.get_guild(DESTINATION_SERVER_ID)
     if not guild:
@@ -1013,6 +1121,7 @@ async def create_channel_and_webhook(category_name, channel_name, server_name):
 
     return None
 
+
 async def process_message(request):
     try:
         message_data = await request.json()
@@ -1023,6 +1132,7 @@ async def process_message(request):
         logging.error(f"❌ ERROR: Failed to process message: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+
 async def start_web_server():
     app = web.Application()
     app.router.add_post("/process_message", process_message)
@@ -1030,6 +1140,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 5000)
     await site.start()
+
 
 async def run_bot():
     bot.webhook_cache = redis_client.hgetall("webhooks")
@@ -1041,7 +1152,9 @@ async def run_bot():
         start_web_server()
     )
 
+
 bot = DestinationBot()
+
 
 @bot.command()
 async def update(ctx, *, description):
@@ -1063,6 +1176,7 @@ async def update(ctx, *, description):
 
     await channel.send(embed=embed)
     await ctx.send("✅ Update posted.")
+
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

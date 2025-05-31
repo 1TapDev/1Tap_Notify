@@ -10,7 +10,7 @@ import traceback
 import signal
 import re
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Setup logging directory
 if not os.path.exists("logs"):
@@ -103,7 +103,7 @@ def save_user_info(token, user_info):
             "id": str(user_info.id),
             "name": str(user_info),
             "discriminator": user_info.discriminator if hasattr(user_info, 'discriminator') else "0",
-            "last_successful_login": datetime.now().isoformat()
+            "last_successful_login": datetime.now(timezone.utc).isoformat()
         }
         save_config(config)
         logging.info(f"✅ Saved user info for {user_info} to config")
@@ -115,7 +115,7 @@ def mark_token_as_failed(token, error_message):
     if token in config["tokens"]:
         config["tokens"][token]["status"] = "failed"
         config["tokens"][token]["last_error"] = error_message
-        config["tokens"][token]["last_failed_attempt"] = datetime.now().isoformat()
+        config["tokens"][token]["last_failed_attempt"] = datetime.now(timezone.utc).isoformat()
         save_config(config)
 
 
@@ -139,10 +139,10 @@ class MirrorSelfBot(discord.Client):
         self.login_attempts = 0
 
     async def on_disconnect(self):
-        logging.warning(f"🔌 Disconnected from Discord at {datetime.utcnow().isoformat()}")
+        logging.warning(f"🔌 Disconnected from Discord at {datetime.now(timezone.utc).isoformat()}")
 
     async def on_resumed(self):
-        logging.info(f"🔄 Connection resumed with Discord at {datetime.utcnow().isoformat()}")
+        logging.info(f"🔄 Connection resumed with Discord at {datetime.now(timezone.utc).isoformat()}")
 
     def is_time_or_date_based(self, name):
         clean_name = re.sub(r'[^\w\s:-]', '', name.lower())
@@ -334,17 +334,24 @@ class MirrorSelfBot(discord.Client):
             print("⚠️ ERROR: aiohttp session is not initialized!")
             self.session = aiohttp.ClientSession()
 
-        for attempt in range(retries):
+        attempt = 0
+        while True:
             try:
                 async with self.session.post(DESTINATION_BOT_URL, json=message_data) as response:
-                    response_text = await response.text()
                     if response.status == 200:
                         return
                     else:
-                        print(f"❌ ERROR: Failed to send message ({response.status}) - {response_text}")
+                        text = await response.text()
+                        logging.error(f"❌ ERROR: Failed to send message ({response.status}) → {text}")
+                        await asyncio.sleep(5)
+            except aiohttp.ClientConnectionError as e:
+                if attempt == 0:
+                    print("🔌 Connection to destination bot failed. Will keep retrying silently...")
+                attempt += 1
+                await asyncio.sleep(10)  # Wait longer before retrying
             except Exception as e:
-                print(f"❌ ERROR: Exception in sending message (attempt {attempt + 1}): {e}")
-            await asyncio.sleep(2)
+                logging.error(f"❌ Unexpected error in send_to_destination: {e}")
+                await asyncio.sleep(10)
 
     async def close(self):
         if self.session:

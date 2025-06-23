@@ -72,7 +72,6 @@ MAX_LOGIN_ATTEMPTS = config["settings"].get("max_login_attempts", 3)  # Add this
 # Track failed tokens
 failed_tokens = set()
 
-
 def get_excluded_categories(server_id):
     """Retrieve excluded categories for a given server from TOKENS data."""
     for token_data in TOKENS.values():
@@ -119,24 +118,211 @@ def mark_token_as_failed(token, error_message):
         save_config(config)
 
 
+def is_dm_mirroring_enabled(token):
+    """Check if DM mirroring is enabled for this token."""
+    token_data = TOKENS.get(token, {})
+    dm_config = token_data.get("dm_mirroring", {})
+    return dm_config.get("enabled", False)
+
+
+def get_dm_destination_server(token):
+    """Get the destination server ID for DM mirroring."""
+    token_data = TOKENS.get(token, {})
+    dm_config = token_data.get("dm_mirroring", {})
+    return dm_config.get("destination_server_id")
+
+
+def normalize_username_for_channel(username):
+    """Normalize a username to be safe for Discord channel names."""
+    # Remove emojis, special characters, and normalize
+    cleaned = re.sub(r'[^\w\s\-_]', '', username)
+    # Replace spaces with hyphens and convert to lowercase
+    cleaned = cleaned.replace(' ', '-').lower()
+    # Remove multiple consecutive hyphens
+    cleaned = re.sub(r'-+', '-', cleaned)
+    # Remove underscores and replace with hyphens
+    cleaned = cleaned.replace('_', '-')
+    # Ensure it starts and ends with alphanumeric
+    cleaned = cleaned.strip('-_')
+    # Ensure it's not empty
+    if not cleaned:
+        cleaned = "unknown-user"
+    return cleaned
+
+
+def find_token_for_user(target_user_id):
+    """Find which token corresponds to a specific user ID."""
+    for token, token_data in TOKENS.items():
+        user_info = token_data.get("user_info", {})
+        if user_info.get("id") == str(target_user_id):
+            return token
+    return None
+
+
+def find_token_by_username(username):
+    """Find token by username (fallback method)."""
+    for token, token_data in TOKENS.items():
+        user_info = token_data.get("user_info", {})
+        if user_info.get("name", "").lower() == username.lower():
+            return token
+    return None
+
+
+def get_user_display_name(user):
+    """Get the best display name for a user."""
+    # Priority: global_name > display_name > username
+    if hasattr(user, 'global_name') and user.global_name:
+        return user.global_name
+    elif hasattr(user, 'display_name') and user.display_name:
+        return user.display_name
+    else:
+        return str(user).replace("#0", "")
+
+
+def is_spam_dm(message):
+    """Check if a DM message appears to be spam."""
+    content = message.content.lower()
+
+    # Common spam indicators
+    spam_keywords = [
+        "free", "money", "profit", "trading", "investment", "crypto", "bitcoin",
+        "earn", "daily", "guaranteed", "risk-free", "expert", "forex", "stocks",
+        "options", "mutual server", "click", "link", "http", "www", ".com",
+        "discord.gg", "join", "server", "community", "telegram", "@everyone",
+        "nitro", "gift", "giveaway", "winner", "congratulations", "claim",
+        "verify", "account", "suspended", "banned", "appeal", "support",
+        "official", "staff", "admin", "moderator", "team discord"
+    ]
+
+    # Check for spam keywords
+    spam_count = sum(1 for keyword in spam_keywords if keyword in content)
+    if spam_count >= 2:  # If 2 or more spam keywords
+        return True
+
+    # Check for excessive links
+    if content.count("http") > 1 or content.count(".com") > 1:
+        return True
+
+    # Check for excessive emojis (spam often has many emojis)
+    emoji_count = len([char for char in content if ord(char) > 127])
+    if emoji_count > 10:
+        return True
+
+    # Check message length patterns
+    if len(content) > 500:  # Very long messages are often spam
+        return True
+
+    return False
+
+
+def is_friend_request_dm(message):
+    """Check if this is a friend request related DM."""
+    # If the user is not in any mutual servers and sends a DM, it's likely a friend request
+    if not message.author.mutual_guilds:
+        return True
+
+    # Check if user has very few mutual servers (likely spam)
+    if len(message.author.mutual_guilds) < 2:
+        return True
+
+    return False
+
+
+def should_allow_dm(message):
+    """Determine if a DM should be allowed through the filter."""
+    # Always allow DMs from users in monitored servers
+    for guild in message.author.mutual_guilds:
+        if str(guild.id) in get_monitored_server_ids():
+            return True
+
+    # Block spam messages
+    if is_spam_dm(message):
+        logging.info(f"🚫 Blocked spam DM from {message.author}: {message.content[:50]}...")
+        return False
+
+    # Block friend request DMs (no mutual servers)
+    if is_friend_request_dm(message):
+        logging.info(f"🚫 Blocked friend request DM from {message.author}: {message.content[:50]}...")
+        return False
+
+    return True
+
+
+def get_monitored_server_ids():
+    """Get all server IDs that are being monitored."""
+    monitored_servers = set()
+    for token_data in TOKENS.values():
+        if "servers" in token_data:
+            monitored_servers.update(token_data["servers"].keys())
+    return monitored_servers
+
+
+def is_allowed_bot(user):
+    """Check if this bot is allowed to send DMs."""
+    # List of allowed bot IDs or names
+    allowed_bots = [
+        "zebra check",
+        "divine monitor",
+        "divine",
+        "hidden clearance bot",
+        "monitor",
+        "ticket tool",
+        "notification",
+        "alert",
+        "checker",
+        "1tap",
+        "sneaker",
+        "cook"
+    ]
+
+    # Check if bot name contains allowed keywords
+    bot_name = user.display_name.lower() if user.display_name else str(user).lower()
+    for allowed in allowed_bots:
+        if allowed in bot_name:
+            return True
+
+    return False
+
+
 class MirrorSelfBot(discord.Client):
     def __init__(self, token, monitored_servers):
         super().__init__(enable_guild_compression=True)
         self.token = token
         self.monitored_servers = {str(server_id) for server_id in monitored_servers}
-        self.session = aiohttp.ClientSession()  # ✅ Initialize session here
+        self.session = aiohttp.ClientSession()
         self.login_attempts = 0
         self.max_attempts = MAX_LOGIN_ATTEMPTS
+        # Track destination bot's user ID to prevent echo loops
+        self.destination_bot_id = None
 
     async def on_ready(self):
         await self.fetch_guilds()
-        print(f"✅ Self-bot {self.user} is now monitoring servers: {self.monitored_servers}")
+        print(f"✅ Self-bot {self.user} is running!")
 
         # Save user info on successful login
         save_user_info(self.token, self.user)
 
         # Reset login attempts on successful connection
         self.login_attempts = 0
+
+        # Try to get destination bot's user ID to prevent echo loops
+        await self.get_destination_bot_id()
+
+    async def get_destination_bot_id(self):
+        """Fetch the destination bot's user ID to prevent echo loops."""
+        try:
+            destination_server_id = get_dm_destination_server(self.token)
+            if destination_server_id:
+                guild = discord.utils.get(self.guilds, id=int(destination_server_id))
+                if guild:
+                    # Look for the bot that owns the webhooks
+                    for member in guild.members:
+                        if member.bot and "1tap" in member.name.lower():
+                            self.destination_bot_id = member.id
+                            logging.info(f"🤖 Found destination bot ID: {self.destination_bot_id}")
+                            break
+        except Exception as e:
+            logging.warning(f"⚠️ Could not determine destination bot ID: {e}")
 
     async def on_disconnect(self):
         logging.warning(f"🔌 Disconnected from Discord at {datetime.now(timezone.utc).isoformat()}")
@@ -209,9 +395,18 @@ class MirrorSelfBot(discord.Client):
 
     async def on_message(self, message):
         await asyncio.sleep(0.5)  # Small delay to let Discord register attachments
-        """Process messages and ensure they belong to monitored servers."""
+
+        # Skip messages from the destination bot to prevent echo loops
+        if self.destination_bot_id and message.author.id == self.destination_bot_id:
+            return
+
+        # Handle DM messages
+        if isinstance(message.channel, discord.DMChannel):
+            return await self.handle_dm_message(message)
+
+        # Handle guild messages (existing logic)
         if not message.guild:
-            return  # Ignore DMs
+            return  # Ignore other non-guild messages
 
         if (
                 message.author.bot
@@ -315,6 +510,86 @@ class MirrorSelfBot(discord.Client):
         # ✅ Send to bot.py
         await self.send_to_destination(message_data)
 
+    async def handle_dm_message(self, message):
+        """Handle DM messages for mirroring."""
+        # Skip if DM mirroring is not enabled for this token
+        if not is_dm_mirroring_enabled(self.token):
+            return
+
+        # Skip messages from self
+        if message.author.id == self.user.id:
+            return
+
+        # Handle bot messages separately
+        if message.author.bot:
+            # Only allow specific bots
+            if not is_allowed_bot(message.author):
+                logging.info(f"🚫 Blocked DM from unauthorized bot: {message.author}")
+                return
+            else:
+                logging.info(f"✅ Allowing DM from authorized bot: {message.author}")
+        else:
+            # For non-bot users, apply spam/friend request filters
+            if not should_allow_dm(message):
+                return
+
+        destination_server_id = get_dm_destination_server(self.token)
+        if not destination_server_id:
+            logging.warning(
+                f"⚠️ DM mirroring enabled but no destination server configured for token {self.token[:10]}...")
+            return
+
+        # Get proper display names
+        author_display_name = get_user_display_name(message.author)
+        self_display_name = get_user_display_name(self.user)
+
+        logging.info(
+            f"📨 Processing DM from {author_display_name} (ID: {message.author.id}) to {self_display_name} (ID: {self.user.id})")
+
+        # Create DM message data with correct token mapping
+        message_data = {
+            "message_type": "dm",
+            "reply_to": None,
+            "reply_text": None,
+            "channel_real_name": f"dm-{normalize_username_for_channel(author_display_name)}",
+            "server_real_name": f"@{self_display_name} [DM]",
+            "mentioned_roles": {},
+            "message_id": str(message.id),
+            "channel_id": str(message.channel.id),
+            "channel_name": f"dm-{normalize_username_for_channel(author_display_name)}",
+            "category_name": f"@{self_display_name} [DM]",
+            "server_id": "dm",
+            "server_name": f"@{self_display_name} [DM]",
+            "content": message.content,
+            "author_id": str(message.author.id),
+            "author_name": author_display_name,
+            "author_avatar": message.author.avatar.url if message.author.avatar else None,
+            "timestamp": str(message.created_at),
+            "attachments": [attachment.url for attachment in message.attachments],
+            "forwarded_from": None,
+            "embeds": (
+                [self.format_embed(embed) for embed in message.embeds]
+                if message.embeds else
+                [{"image": {"url": message.attachments[0].url}}] if message.attachments else []
+            ),
+            "destination_server_id": destination_server_id,
+            "dm_user_id": str(message.author.id),
+            "dm_username": author_display_name,
+            "self_user_id": str(self.user.id),
+            "self_username": self_display_name,
+            "receiving_token": self.token,  # Token of the person receiving the DM
+            "sender_user_id": str(message.author.id),  # ID of the person sending the DM
+            "is_bot": message.author.bot,  # Add bot flag
+            "bot_name": str(message.author) if message.author.bot else None  # Bot name for reference
+        }
+
+        try:
+            redis_client.lpush("message_queue", json.dumps(message_data))
+            logging.info(f"✅ QUEUED DM to Redis: message_id={message.id} from {author_display_name}")
+            log_message(f"📨 Pushed DM from {author_display_name} to Redis.")
+        except Exception as e:
+            logging.error(f"❌ ERROR: Failed to push DM to Redis: {e}")
+
     def format_embed(self, embed):
         return {
             "title": embed.title or None,
@@ -352,6 +627,24 @@ class MirrorSelfBot(discord.Client):
             except Exception as e:
                 logging.error(f"❌ Unexpected error in send_to_destination: {e}")
                 await asyncio.sleep(10)
+
+    async def send_dm_to_user(self, user_id, content):
+        """Send a DM to a specific user using this bot's token."""
+        try:
+            user = await self.fetch_user(int(user_id))
+            if user:
+                await user.send(content)
+                logging.info(f"✅ Sent DM to {user}: {content[:50]}...")
+                return True
+            else:
+                logging.error(f"❌ Could not find user with ID {user_id}")
+                return False
+        except discord.Forbidden as e:
+            logging.error(f"❌ Cannot send DM to user {user_id}: {e}")
+            return False
+        except Exception as e:
+            logging.error(f"❌ Failed to send DM to user {user_id}: {e}")
+            return False
 
     async def close(self):
         if self.session:
@@ -430,13 +723,168 @@ def shutdown_handler(bot_instances):
     return handler
 
 
+# Global storage for bot instances to enable DM relay functionality
+bot_instances = {}
+
+
+async def send_dm_via_token(token, user_id, content):
+    """Send a DM using a specific token's bot instance."""
+    try:
+        logging.info(f"🔍 Looking for bot instance with token {token[:10]}...")
+        logging.info(f"🔍 Available bot instances: {list(bot_instances.keys())[:3]}...")  # Show first 3 tokens
+
+        if token in bot_instances:
+            bot_instance = bot_instances[token]
+            logging.info(f"✅ Found bot instance for token {token[:10]}...")
+
+            success = await bot_instance.send_dm_to_user(user_id, content)
+            if success:
+                logging.info(f"✅ DM sent successfully via token {token[:10]}... to user {user_id}")
+            else:
+                logging.error(f"❌ Failed to send DM via token {token[:10]}... to user {user_id}")
+            return success
+        else:
+            logging.error(f"❌ Bot instance not found for token {token[:10]}...")
+            logging.error(f"❌ Available tokens: {[t[:10] + '...' for t in bot_instances.keys()]}")
+            return False
+    except Exception as e:
+        logging.error(f"❌ Exception in send_dm_via_token: {e}")
+        return False
+
+
+async def share_bot_instances():
+    """Share bot instances with bot.py for channel blocking."""
+    try:
+        instance_data = {}
+        for token, bot_instance in bot_instances.items():
+            if bot_instance.user:
+                instance_data[token] = {
+                    "user_id": str(bot_instance.user.id),
+                    "username": str(bot_instance.user),
+                    "guilds": [str(guild.id) for guild in bot_instance.guilds]
+                }
+
+        redis_client.set("bot_instances", json.dumps(instance_data))
+        logging.info("✅ Shared bot instance data with bot.py")
+    except Exception as e:
+        logging.error(f"❌ Failed to share bot instances: {e}")
+
+
+async def share_bot_instances_periodically():
+    """Periodically share bot instance data."""
+    await asyncio.sleep(60)  # Wait for bots to be ready
+    while True:
+        await share_bot_instances()
+        await asyncio.sleep(30)  # Update every 30 seconds
+
+
+async def start_dm_relay_service():
+    """Start a web service to handle DM relay requests from bot.py."""
+    from aiohttp import web
+
+    async def handle_dm_relay(request):
+        """Handle DM relay requests."""
+        try:
+            data = await request.json()
+            action = data.get("action")
+
+            logging.info(f"📨 Received DM relay request: {data}")
+
+            if action == "send_dm":
+                token = data.get("token")
+                user_id = data.get("user_id")
+                content = data.get("content", "")
+                attachments = data.get("attachments", [])
+
+                logging.info(
+                    f"📤 Processing DM relay: token={token[:10]}... user_id={user_id} content='{content[:50]}...'")
+
+                # Check if bot instance exists
+                if token not in bot_instances:
+                    error_msg = f"Bot instance not found for token {token[:10]}..."
+                    logging.error(f"❌ {error_msg}")
+                    return web.json_response({"status": "error", "message": error_msg}, status=404)
+
+                # Send DM via the appropriate bot instance
+                success = await send_dm_via_token(token, user_id, content)
+
+                if success:
+                    logging.info(f"✅ DM relay successful to user {user_id}")
+                    return web.json_response({"status": "success"}, status=200)
+                else:
+                    error_msg = f"Failed to send DM to user {user_id}"
+                    logging.error(f"❌ {error_msg}")
+                    return web.json_response({"status": "error", "message": error_msg}, status=500)
+            elif action == "request_sync":
+                # Handle sync request from bot.py
+                logging.info("📤 Received server sync request from bot.py")
+                await sync_server_info_to_bot()
+                return web.json_response({"status": "success", "message": "Server sync triggered"}, status=200)
+            else:
+                error_msg = f"Unknown action: {action}"
+                logging.error(f"❌ {error_msg}")
+                return web.json_response({"status": "error", "message": error_msg}, status=400)
+
+        except Exception as e:
+            error_msg = f"Error in DM relay service: {str(e)}"
+            logging.error(f"❌ {error_msg}")
+            return web.json_response({"status": "error", "message": error_msg}, status=500)
+
+    app = web.Application()
+    app.router.add_post("/send_dm", handle_dm_relay)
+    app.router.add_post("/request_sync", handle_dm_relay)  # Add sync endpoint
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 5001)
+    await site.start()
+    logging.info("✅ DM relay service started on port 5001")
+    print("📡 DM relay service running on http://127.0.0.1:5001")
+
+
+async def process_dm_relay_queue():
+    """Process DM relay requests from Redis queue."""
+    while True:
+        try:
+            # Check for DM relay requests
+            relay_data = redis_client.rpop("dm_relay_queue")
+            if relay_data:
+                try:
+                    relay_request = json.loads(relay_data)
+                    token = relay_request.get("token")
+                    user_id = relay_request.get("user_id")
+                    content = relay_request.get("content", "")
+
+                    # Send the DM
+                    success = await send_dm_via_token(token, user_id, content)
+                    if success:
+                        logging.info(f"✅ DM relay successful to user {user_id}")
+                    else:
+                        logging.error(f"❌ DM relay failed to user {user_id}")
+
+                except json.JSONDecodeError:
+                    logging.error(f"❌ Invalid JSON in DM relay queue: {relay_data}")
+                except Exception as e:
+                    logging.error(f"❌ Error processing DM relay: {e}")
+
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            logging.error(f"❌ Error in DM relay queue processor: {e}")
+            await asyncio.sleep(5)
+
+
 # Start listening for requests
 async def main():
-    bot_instances = []
+    global bot_instances
 
     # First, add the max_login_attempts setting if it doesn't exist
     if "max_login_attempts" not in config.get("settings", {}):
         config["settings"]["max_login_attempts"] = 3
+        save_config(config)
+
+    # Initialize dm_mappings if it doesn't exist
+    if "dm_mappings" not in config:
+        config["dm_mappings"] = {}
         save_config(config)
 
     enabled_tokens = [(t, d) for t, d in TOKENS.items() if not d.get("disabled", False) and d.get("status") != "failed"]
@@ -444,6 +892,10 @@ async def main():
     if not enabled_tokens:
         print("❌ No valid tokens found. Please check your config.json")
         return
+
+    # Start DM relay service
+    asyncio.create_task(start_dm_relay_service())
+    asyncio.create_task(process_dm_relay_queue())
 
     for index, (token, token_data) in enumerate(enabled_tokens):
         server_ids = set(token_data["servers"].keys())
@@ -456,8 +908,14 @@ async def main():
         else:
             print(f"🔹 Loading bot with token {token[:10]}... Monitoring servers: {server_ids}")
 
+        # Show DM mirroring status
+        dm_config = token_data.get("dm_mirroring", {})
+        if dm_config.get("enabled", False):
+            dest_server = dm_config.get("destination_server_id", "Not Set")
+            print(f"📨 DM mirroring enabled → Destination: {dest_server}")
+
         bot = MirrorSelfBot(token, server_ids)
-        bot_instances.append(bot)
+        bot_instances[token] = bot  # Store for DM relay functionality
 
         async def try_start_bot(bot_instance, token):
             delay = 5
@@ -500,6 +958,10 @@ async def main():
         asyncio.create_task(try_start_bot(bot, token))
 
     print("⏳ Waiting for self-bots to finish login...")
+    print("📨 DM relay service active on port 5001")
+    print("🔄 Server sync service active")
+
+    asyncio.create_task(share_bot_instances_periodically())
 
     # Show summary of failed tokens at the end
     if failed_tokens:
@@ -516,7 +978,7 @@ async def main():
             await asyncio.sleep(3600)
     finally:
         print("👋 Shutting down...")
-        for bot in bot_instances:
+        for bot in bot_instances.values():
             await bot.close()
 
 

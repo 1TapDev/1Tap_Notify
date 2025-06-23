@@ -12,7 +12,7 @@ import threading
 import requests
 import re
 from discord.ext import commands
-from discord.ext import tasks
+from discord import app_commands
 from aiohttp import web
 from datetime import datetime, timedelta
 
@@ -33,7 +33,7 @@ logging.basicConfig(
     filename=log_filename,
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M-%S"
 )
 
 # Configure console to only show errors
@@ -46,19 +46,43 @@ logging.getLogger().addHandler(console_handler)
 # Load configuration from config.json
 CONFIG_FILE = "config.json"
 
-with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-    config = json.load(f)
+def load_config():
+    """Load configuration from config.json file."""
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_config(config_data):
+    """Save configuration to config.json file."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, indent=4)
+
+config = load_config()
 
 BOT_TOKEN = config.get("bot_token")
 DESTINATION_SERVER_ID = config["destination_server"]
 WEBHOOKS = config.get("webhooks", {})
 TOKENS = config.get("tokens", {})
-MAX_DISCORD_FILE_SIZE = 8 * 1024 * 1024  # 8MB
+DM_MAPPINGS = config.get("dm_mappings", {})
+MAX_DISCORD_FILE_SIZE = 7.5 * 1024 * 1024  # 7.5MB instead of 8MB
+
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
 # Global cache to track recent message_ids and prevent duplicates
 recent_message_ids = set()
+
+# In-memory set to track channels deleted by Polar Helper to avoid recreating them
+polar_deleted_channels = set()
+
+# Create bot instance with slash command support
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.reactions = True
+intents.members = True
+
+# Store for DM relay functionality
+dm_relay_endpoint = "http://127.0.0.1:5001/send_dm"  # Endpoint to send DMs via main.py
 
 
 def get_next_version():
@@ -110,8 +134,7 @@ def cleanup_dead_webhooks():
         redis_client.hdel("webhooks", key)
 
     if to_delete:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
+        save_config(config)
         logging.info(f"✅ Removed {len(to_delete)} dead webhooks from config and Redis.")
     else:
         logging.info("✅ Cleanup completed — no dead webhooks found.")
@@ -157,67 +180,146 @@ def normalize_name(name: str) -> str:
     )
 
 
-async def monitor_for_archive():
-    await bot.wait_until_ready()
-    guild = bot.get_guild(DESTINATION_SERVER_ID)
+def normalize_username_for_channel(username):
+    """Normalize a username to be safe for Discord channel names."""
+    # Remove emojis, special characters, and normalize
+    cleaned = re.sub(r'[^\w\s\-_]', '', username)
+    # Replace spaces with hyphens and convert to lowercase
+    cleaned = cleaned.replace(' ', '-').lower()
+    # Remove multiple consecutive hyphens
+    cleaned = re.sub(r'-+', '-', cleaned)
+    # Ensure it starts and ends with alphanumeric
+    cleaned = cleaned.strip('-_')
+    # Ensure it's not empty
+    if not cleaned:
+        cleaned = "unknown-user"
+    return cleaned
 
-    if not guild:
-        logging.error("❌ Destination server not found in monitor_for_archive")
-        return
+def find_token_for_user(target_user_id):
+    """Find which token corresponds to a specific user ID."""
+    for token, token_data in TOKENS.items():
+        user_info = token_data.get("user_info", {})
+        if user_info.get("id") == str(target_user_id):
+            return token
+    return None
 
-    while not bot.is_closed():
-        try:
-            for channel in guild.text_channels:
-                try:
-                    messages = [message async for message in channel.history(limit=50)]
-                    for msg in messages:
-                        content_lower = msg.content.lower()
-                        if "!archive" in content_lower or "archived to forum thread" in content_lower:
-                            logging.info(f"🗑️ Archive command detected in '{channel.name}' → Message: {msg.content}")
 
-                            server_name_raw = guild.name
-                            category_name_raw = channel.category.name if channel.category else "Uncategorized"
+def find_token_by_username(username):
+    """Find token by username (fallback method)."""
+    for token, token_data in TOKENS.items():
+        user_info = token_data.get("user_info", {})
+        if user_info.get("name", "").lower() == username.lower():
+            return token
+    return None
 
-                            server_name = server_name_raw.split(" [")[0].strip()
-                            category_name = category_name_raw.split(" [")[0].strip()
-                            logging.info(f"📂 Archive check: Server='{server_name}' | Category='{category_name}'")
 
-                            forum_mappings = config.get("archived_forums", {})
-                            normalized_category = normalize_category(category_name)
-                            normalized_server = normalize_server_tag(server_name)
-                            forum_target = forum_mappings.get(f"{normalized_category} [{normalized_server}]")
+def get_user_display_name(user):
+    """Get the best display name for a user."""
+    # Priority: global_name > display_name > username
+    if hasattr(user, 'global_name') and user.global_name:
+        return user.global_name
+    elif hasattr(user, 'display_name') and user.display_name:
+        return user.display_name
+    else:
+        return str(user).replace("#0", "")
 
-                            logging.info(f"🔍 Looking for: forum_mappings[{server_name}][{category_name}]")
-                            logging.info(f"📦 Full forum mappings: {forum_mappings}")
 
-                            if not forum_target:
-                                logging.warning(f"⚠️ No forum mapping for '{category_name}' in server '{server_name}'")
-                            else:
-                                forum_channel = discord.utils.get(guild.forum_channels, name=forum_target)
-                                if forum_channel:
-                                    try:
-                                        base_msg = await forum_channel.send(
-                                            content=f"Auto-archived from #{channel.name}")
-                                        thread = await forum_channel.create_thread(name=channel.name, message=base_msg)
-                                        logging.info(f"✅ Created thread '{thread.name}' in forum '{forum_target}'")
-                                    except Exception as e:
-                                        logging.error(f"❌ Failed to create thread in forum '{forum_target}': {e}")
-                                else:
-                                    logging.warning(f"⚠️ Forum channel '{forum_target}' not found in guild")
+def parse_channel_info(channel_name):
+    return parse_channel_info_fixed(channel_name)
 
-                            await channel.delete(reason="!archive command triggered")
-                            logging.info(f"✅ Deleted channel '{channel.name}'")
+def find_original_channel_mapping(channel_name, server_tag):
+    """Find the original server ID and channel that corresponds to this mirrored channel."""
+    for webhook_key in WEBHOOKS.keys():
+        if f"[{server_tag.lower().replace(' ', '-')}]" in webhook_key:
+            parts = webhook_key.split("/")
+            if len(parts) == 2:
+                webhook_channel = parts[1]
+                if webhook_channel == channel_name.lower().replace(" ", "-").replace("|", ""):
+                    for token_data in TOKENS.values():
+                        for server_id, server_config in token_data.get("servers", {}).items():
+                            return server_id, None
+    return None, None
 
-                            break  # Stop checking this channel after archiving
-                except discord.Forbidden:
-                    logging.warning(f"⚠️ No permission to access '{channel.name}'")
-                except Exception as e:
-                    logging.error(f"❌ Exception in monitor_for_archive for '{channel.name}': {e}")
-            await asyncio.sleep(10)
-        except Exception as e:
-            logging.error(f"❌ monitor_for_archive loop error: {e}")
-            await asyncio.sleep(5)
 
+async def add_channel_to_exclusions(server_id, channel_id, token=None):
+    """Add a channel to the excluded_channels list for the appropriate token and server."""
+    config_data = load_config()  # Load fresh config
+
+    if token:
+        if token in config_data["tokens"] and server_id in config_data["tokens"][token]["servers"]:
+            if "excluded_channels" not in config_data["tokens"][token]["servers"][server_id]:
+                config_data["tokens"][token]["servers"][server_id]["excluded_channels"] = []
+
+            excluded_channels = config_data["tokens"][token]["servers"][server_id]["excluded_channels"]
+            if int(channel_id) not in excluded_channels:
+                excluded_channels.append(int(channel_id))
+                save_config(config_data)
+                return True
+    else:
+        added_count = 0
+        for token_key, token_data in config_data["tokens"].items():
+            if server_id in token_data.get("servers", {}):
+                if "excluded_channels" not in token_data["servers"][server_id]:
+                    token_data["servers"][server_id]["excluded_channels"] = []
+
+                excluded_channels = token_data["servers"][server_id]["excluded_channels"]
+                if int(channel_id) not in excluded_channels:
+                    excluded_channels.append(int(channel_id))
+                    added_count += 1
+
+        if added_count > 0:
+            save_config(config_data)
+            return True
+
+    return False
+
+
+async def find_and_block_original_channel(channel_name, server_tag):
+    """Find the original channel and add it to exclusions."""
+    try:
+        # Get bot instance data from Redis
+        bot_instances_data = redis_client.get("bot_instances")
+        if not bot_instances_data:
+            return False
+
+        instances = json.loads(bot_instances_data)
+        normalized_name = channel_name.lower().replace(" ", "-").replace("|", "")
+
+        config_data = load_config()
+        for token, instance_info in instances.items():
+            if token in config_data["tokens"]:
+                for server_id in config_data["tokens"][token].get("servers", {}):
+                    try:
+                        # Make API call to find channels
+                        headers = {"Authorization": f"Bot {BOT_TOKEN}"}
+                        url = f"https://discord.com/api/v10/guilds/{server_id}/channels"
+
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url, headers=headers) as response:
+                                if response.status == 200:
+                                    channels = await response.json()
+
+                                    for channel_data in channels:
+                                        if channel_data.get("type") == 0:  # Text channel
+                                            if channel_data["name"].lower().replace("-", "").replace("_",
+                                                                                                     "") == normalized_name.replace(
+                                                    "-", "").replace("_", ""):
+                                                success = await add_channel_to_exclusions(server_id,
+                                                                                          str(channel_data["id"]),
+                                                                                          token)
+                                                if success:
+                                                    logging.info(
+                                                        f"✅ Blocked channel {channel_data['name']} (ID: {channel_data['id']}) in server {server_id}")
+                                                    return True
+                    except Exception as e:
+                        logging.error(f"❌ Error checking server {server_id}: {e}")
+                        continue
+
+        return False
+
+    except Exception as e:
+        logging.error(f"❌ Error in find_and_block_original_channel: {e}")
+        return False
 
 async def process_redis_messages():
     try:
@@ -235,7 +337,11 @@ async def process_redis_messages():
                     if "message_id" not in message:
                         raise ValueError("Missing required field: message_id")
 
-                    await send_to_webhook(message)
+                    # Check if this is a DM message
+                    if message.get("message_type") == "dm":
+                        await handle_dm_message(message)
+                    else:
+                        await send_to_webhook(message)
                     processed += 1
                 except Exception as e:
                     logging.error(f"❌ Failed to process single Redis message: {e} → Data: {message_data}")
@@ -251,6 +357,438 @@ async def process_redis_messages():
             await asyncio.sleep(1)
     except Exception as e:
         logging.error(f"❌ ERROR: Failed to process Redis messages: {e}")
+
+
+def get_monitored_servers():
+    """Get list of monitored servers from synced config"""
+    try:
+        config_data = load_config()
+
+        # First try to get from synced data
+        server_names = config_data.get("server_names", [])
+        if server_names:
+            logging.info(f"✅ Loaded {len(server_names)} servers from sync")
+            return server_names
+
+        # Fallback to manual list if no sync data
+        fallback_servers = [
+            "strike-access",
+            "ak-chefs",
+            "polar-chefs",
+            "divine",
+            "shoeplex",
+            "gfnf",
+            "fastbreak"
+        ]
+
+        logging.warning("⚠️ Using fallback server list - server sync may not be working")
+        return fallback_servers
+
+    except Exception as e:
+        logging.error(f"❌ Error loading server names: {e}")
+        return []
+
+
+def parse_channel_info_fixed(channel_name):
+    """Parse channel name to extract original server and channel info."""
+    # Method 1: Standard format "channel-name [server-tag]"
+    if "[" in channel_name and "]" in channel_name:
+        base_name = channel_name.split(" [")[0].strip()
+        server_tag = channel_name.split("[")[-1].split("]")[0].strip()
+        return base_name, server_tag
+
+    # Method 2: Use actual server names from config
+    monitored_servers = get_monitored_servers()
+    channel_lower = channel_name.lower()
+
+    # Sort by length (longest first) to match more specific names first
+    sorted_servers = sorted(monitored_servers, key=len, reverse=True)
+
+    for server_name in sorted_servers:
+        # Check if server name keywords are in channel name
+        server_keywords = server_name.split("-")
+
+        # Check if all keywords from server name are in channel name
+        if all(keyword in channel_lower for keyword in server_keywords):
+            # Remove server keywords from channel name to get base name
+            base_name = channel_name
+            for keyword in server_keywords:
+                base_name = base_name.replace(f"-{keyword}", "").replace(keyword, "")
+            base_name = base_name.strip("-").strip()
+            return base_name, server_name
+
+    # Method 3: No pattern found
+    return channel_name, None
+
+
+def get_channel_suggestions(channel_name):
+    """Get suggestions for what server this channel might belong to."""
+    monitored_servers = get_monitored_servers()
+    channel_lower = channel_name.lower()
+    suggestions = []
+
+    # Score each server based on keyword matches
+    server_scores = {}
+    for server_name in monitored_servers:
+        score = 0
+        server_keywords = server_name.split("-")
+
+        for keyword in server_keywords:
+            if keyword in channel_lower:
+                score += 1
+
+        if score > 0:
+            server_scores[server_name] = score
+
+    # Return servers sorted by match score (best matches first)
+    suggestions = sorted(server_scores.keys(), key=lambda x: server_scores[x], reverse=True)
+
+    return suggestions[:5]  # Return top 5 suggestions
+
+def parse_channel_info(channel_name):
+    """Parse channel name to extract original server and channel info."""
+    if "[" in channel_name and "]" in channel_name:
+        base_name = channel_name.split(" [")[0].strip()
+        server_tag = channel_name.split("[")[-1].split("]")[0].strip()
+        return base_name, server_tag
+    return channel_name, None
+
+
+def find_original_channel_mapping(channel_name, server_tag):
+    """Find the original server ID and channel that corresponds to this mirrored channel."""
+    # This would need to be enhanced with a mapping system
+    # For now, we'll use the webhook keys to reverse-engineer
+
+    for webhook_key in WEBHOOKS.keys():
+        # Webhook keys are formatted like: "category-[server]/channel"
+        if f"[{server_tag.lower().replace(' ', '-')}]" in webhook_key:
+            # Extract the original channel name from webhook key
+            parts = webhook_key.split("/")
+            if len(parts) == 2:
+                webhook_channel = parts[1]
+                if webhook_channel == channel_name.lower().replace(" ", "-").replace("|", ""):
+                    # Found a match, now we need to find the server ID
+                    for token_data in TOKENS.values():
+                        for server_id, server_config in token_data.get("servers", {}).items():
+                            # This is where we'd need better mapping
+                            # For now, return the first server that has this tag
+                            return server_id, None  # We'll need to find the actual channel ID
+
+    return None, None
+
+
+async def add_channel_to_exclusions(server_id, channel_id, token=None):
+    """Add a channel to the excluded_channels list for the appropriate token and server."""
+    config = load_config()
+
+    if token:
+        # Add to specific token
+        if token in config["tokens"] and server_id in config["tokens"][token]["servers"]:
+            if "excluded_channels" not in config["tokens"][token]["servers"][server_id]:
+                config["tokens"][token]["servers"][server_id]["excluded_channels"] = []
+
+            excluded_channels = config["tokens"][token]["servers"][server_id]["excluded_channels"]
+            if int(channel_id) not in excluded_channels:
+                excluded_channels.append(int(channel_id))
+                save_config(config)
+                return True
+    else:
+        # Add to all tokens that monitor this server
+        added_count = 0
+        for token_key, token_data in config["tokens"].items():
+            if server_id in token_data.get("servers", {}):
+                if "excluded_channels" not in token_data["servers"][server_id]:
+                    token_data["servers"][server_id]["excluded_channels"] = []
+
+                excluded_channels = token_data["servers"][server_id]["excluded_channels"]
+                if int(channel_id) not in excluded_channels:
+                    excluded_channels.append(int(channel_id))
+                    added_count += 1
+
+        if added_count > 0:
+            save_config(config)
+            return True
+
+    return False
+
+async def send_dm_via_webhook(webhook, message_data):
+    """Send a DM message via webhook."""
+    try:
+        content = message_data.get("content", "")
+        attachments = message_data.get("attachments", [])
+        embeds = message_data.get("embeds", [])
+
+        # Clean up the embeds
+        cleaned_embeds = []
+        for embed in embeds:
+            if isinstance(embed, dict) and any([
+                embed.get("title"),
+                embed.get("description"),
+                embed.get("url"),
+                embed.get("image"),
+                embed.get("thumbnail"),
+                embed.get("fields")
+            ]):
+                cleaned_embeds.append(embed)
+
+        # Skip truly empty messages
+        if not content.strip() and not cleaned_embeds and not attachments:
+            logging.info(f"⏭️ Skipped empty DM message_id={message_data.get('message_id')}")
+            return
+
+        # Use display name for webhook username
+        display_name = message_data.get("author_name", "Unknown")
+
+        # Prepare webhook payload
+        payload = {
+            "username": display_name,  # Use the display name directly
+            "avatar_url": message_data.get("author_avatar")
+        }
+
+        if content:
+            payload["content"] = content
+
+        if cleaned_embeds:
+            payload["embeds"] = cleaned_embeds
+
+        # Handle file attachments
+        files = []
+        for idx, url in enumerate(attachments):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            file_data = await resp.read()
+                            filename = url.split("/")[-1].split("?")[0] or f"file{idx}.jpg"
+
+                            if len(file_data) <= MAX_DISCORD_FILE_SIZE:
+                                files.append({
+                                    "filename": filename,
+                                    "data": file_data
+                                })
+                            else:
+                                logging.warning(f"⚠️ File too large, skipping: {filename}")
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to fetch attachment: {url} → {e}")
+
+        # Send via webhook
+        async with aiohttp.ClientSession() as session:
+            try:
+                if files:
+                    from aiohttp import FormData
+                    form = FormData()
+                    for idx, file in enumerate(files):
+                        form.add_field(
+                            name=f"file{idx}",
+                            value=file["data"],
+                            filename=file["filename"],
+                            content_type="application/octet-stream"
+                        )
+                    form.add_field("payload_json", json.dumps(payload))
+
+                    async with session.post(webhook.url, data=form) as response:
+                        if response.status in (200, 204):
+                            logging.info(f"✅ DM webhook message sent successfully")
+                        else:
+                            error = await response.text()
+                            logging.error(f"❌ DM webhook file upload failed ({response.status}) → {error}")
+                else:
+                    async with session.post(webhook.url, json=payload) as response:
+                        if response.status in (200, 204):
+                            logging.info(f"✅ DM webhook message sent successfully")
+                        else:
+                            error = await response.text()
+                            logging.error(f"❌ DM webhook failed ({response.status}) → {error}")
+
+            except Exception as e:
+                logging.error(f"❌ Exception during DM webhook post: {e}")
+
+    except Exception as e:
+        logging.error(f"❌ Error in send_dm_via_webhook: {e}")
+
+
+async def handle_dm_message(message_data):
+    """Handle DM messages by creating appropriate channels and webhooks."""
+    try:
+        guild = bot.get_guild(int(message_data["destination_server_id"]))
+        if not guild:
+            logging.error(f"❌ Destination server not found: {message_data['destination_server_id']}")
+            return
+
+        category_name = message_data["category_name"]
+        channel_name = message_data["channel_name"]
+        dm_user_id = message_data["dm_user_id"]
+        dm_username = message_data["dm_username"]
+        self_username = message_data["self_username"]
+        receiving_token = message_data.get("receiving_token")  # Token of person receiving DM
+        sender_user_id = message_data.get("sender_user_id")  # ID of person sending DM
+
+        # Find or create the DM category
+        category = discord.utils.get(guild.categories, name=category_name)
+        if not category:
+            try:
+                category = await guild.create_category(name=category_name)
+                logging.info(f"✅ Created DM category: {category_name}")
+            except Exception as e:
+                logging.error(f"❌ Failed to create DM category {category_name}: {e}")
+                return
+
+        # Find or create the DM channel
+        channel = discord.utils.get(guild.text_channels, name=channel_name, category=category)
+        if not channel:
+            try:
+                channel = await guild.create_text_channel(name=channel_name, category=category)
+                logging.info(f"✅ Created DM channel: {channel_name}")
+
+                # Set up the channel mapping for relay functionality
+                # The key insight: we need the token that can send DMs to the SENDER
+                sender_token = find_token_for_user(sender_user_id)
+                if not sender_token:
+                    logging.warning(f"⚠️ Could not find token for sender user ID {sender_user_id}")
+                    sender_token = receiving_token  # Fallback to receiving token
+
+                DM_MAPPINGS[str(channel.id)] = {
+                    "user_id": dm_user_id,  # Person who sent the original DM
+                    "username": dm_username,  # Display name of sender
+                    "self_user_id": message_data["self_user_id"],  # Person who received the DM
+                    "receiving_token": receiving_token,  # Token of person who received DM
+                    "sender_token": sender_token,  # Token that can send DMs to the sender
+                    "relay_token": sender_token  # Token to use for relay (sends back to sender)
+                }
+
+                # Save the mapping
+                config["dm_mappings"] = DM_MAPPINGS
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4)
+
+                # Send an informational message with display names
+                embed = discord.Embed(
+                    title="📨 DM Channel Created",
+                    description=f"This channel mirrors DMs between **{self_username}** and **{dm_username}**.\n\nMessages sent here will be forwarded as DMs.",
+                    color=discord.Color.blue()
+                )
+                embed.add_field(name="Sender", value=f"{dm_username} (ID: {dm_user_id})", inline=True)
+                embed.add_field(name="Receiver", value=f"{self_username} (ID: {message_data['self_user_id']})",
+                                inline=True)
+                embed.set_footer(text=f"Relay Token: {sender_token[:10] if sender_token else 'None'}...")
+                await channel.send(embed=embed)
+
+            except Exception as e:
+                logging.error(f"❌ Failed to create DM channel {channel_name}: {e}")
+                return
+        else:
+            # Update existing mapping with proper tokens
+            sender_token = find_token_for_user(sender_user_id)
+            if str(channel.id) in DM_MAPPINGS:
+                DM_MAPPINGS[str(channel.id)].update({
+                    "receiving_token": receiving_token,
+                    "sender_token": sender_token,
+                    "relay_token": sender_token
+                })
+                config["dm_mappings"] = DM_MAPPINGS
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4)
+
+        # Create or get webhook for the channel
+        webhook = await bot.get_or_create_webhook(channel, "DM Mirror")  # FIX: Use bot.get_or_create_webhook
+        if not webhook:
+            logging.error(f"❌ Failed to create webhook for DM channel {channel_name}")
+            return
+
+        # Send the DM message via webhook
+        await send_dm_via_webhook(webhook, message_data)
+
+    except Exception as e:
+        logging.error(f"❌ Error handling DM message: {e}")
+
+async def monitor_dm_channels():
+    """Monitor DM channels for outgoing messages to relay back as DMs."""
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            guild = bot.get_guild(DESTINATION_SERVER_ID)
+            if not guild:
+                await asyncio.sleep(10)
+                continue
+
+            for category in guild.categories:
+                if "[DM]" in category.name:
+                    for channel in category.channels:
+                        if isinstance(channel, discord.TextChannel) and str(channel.id) in DM_MAPPINGS:
+                            # This channel is mapped for DM relay
+                            continue  # The actual monitoring happens in on_message event
+
+        except Exception as e:
+            logging.error(f"❌ Error in monitor_dm_channels: {e}")
+
+        await asyncio.sleep(30)
+
+
+async def relay_message_to_dm(channel, message):
+    """Relay a message from Discord channel back to DM."""
+    try:
+        mapping = DM_MAPPINGS.get(str(channel.id))
+        if not mapping:
+            logging.warning(f"⚠️ No DM mapping found for channel {channel.name}")
+            await message.add_reaction("❌")
+            return
+
+        user_id = mapping["user_id"]  # This is the person who originally sent the DM
+        relay_token = mapping.get("relay_token")  # Token that can send DMs to that person
+
+        # Debug logging
+        logging.info(
+            f"🔍 DM Mapping found: user_id={user_id}, relay_token={relay_token[:10] if relay_token else 'None'}...")
+        logging.info(f"🔍 Full mapping data: {mapping}")
+
+        if not relay_token:
+            logging.error(f"❌ No relay token found for DM channel {channel.name}")
+            await message.add_reaction("❌")
+            return
+
+        # Log the relay attempt
+        logging.info(f"📤 Attempting to relay message to user {user_id} using token {relay_token[:10]}...")
+        logging.info(f"📤 Message content: {message.content[:100]}...")
+
+        # Send DM relay request to main.py
+        relay_data = {
+            "action": "send_dm",
+            "token": relay_token,
+            "user_id": user_id,
+            "content": message.content,
+            "attachments": [attachment.url for attachment in message.attachments]
+        }
+
+        # Add timeout and better error handling
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                logging.info(f"🔗 Sending request to DM relay service...")
+                async with session.post("http://127.0.0.1:5001/send_dm", json=relay_data) as response:
+                    response_text = await response.text()
+                    logging.info(f"📡 DM relay service response: {response.status} - {response_text}")
+
+                    if response.status == 200:
+                        logging.info(f"✅ DM relay request sent successfully to user {user_id}")
+                        await message.add_reaction("✅")
+                    else:
+                        logging.error(f"❌ DM relay request failed: {response.status} - {response_text}")
+                        await message.add_reaction("❌")
+
+            except asyncio.TimeoutError:
+                logging.error("⏰ DM relay request timed out")
+                await message.add_reaction("⏰")
+            except aiohttp.ClientConnectionError:
+                logging.warning("⚠️ Could not connect to DM relay service")
+                await message.add_reaction("⚠️")
+            except Exception as e:
+                logging.error(f"❌ Exception in DM relay request: {e}")
+                await message.add_reaction("❌")
+
+    except Exception as e:
+        logging.error(f"❌ Error in relay_message_to_dm: {e}")
+        await message.add_reaction("💥")
 
 
 async def clean_mentions(content: str, destination_guild: discord.Guild, message_data: dict) -> str:
@@ -373,10 +911,34 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
 async def send_to_webhook(message_data):
     message_id = message_data.get("message_id")
 
+    # If channel was previously deleted due to Polar Helper, skip further processing
+    if message_data["channel_id"] in polar_deleted_channels:
+        logging.info(f"⏭️ Skipping message for deleted channel {message_data['channel_id']} (Polar Helper triggered)")
+        return
+
     # Auto-delete if archive command detected
     archive_trigger = message_data.get("content", "").strip().lower()
     embed_title = (message_data.get("embed_title") or "").lower()
     embed_desc = (message_data.get("embed_description") or "").lower()
+
+    author_username = message_data.get("author_name", "")
+
+    # Polar Helper special archive logic
+    if author_username == "Polar Helper#6493" and (
+            "channel archive" in embed_title or "channel archive" in embed_desc or archive_trigger == "channel archive"
+    ):
+        channel_obj = bot.get_channel(int(message_data["channel_id"]))
+        if channel_obj:
+            try:
+                await channel_obj.delete(reason="Polar Helper triggered channel archive deletion")
+                polar_deleted_channels.add(message_data["channel_id"])
+                logging.info(
+                    f"🗑️ Deleted channel '{channel_obj.name}' (ID: {channel_obj.id}) triggered by Polar Helper")
+            except Exception as e:
+                logging.error(f"❌ Failed to delete channel '{channel_obj.name}': {e}")
+        else:
+            logging.warning(
+                f"⚠️ Channel not found in cache for Polar Helper archive delete: {message_data['channel_id']}")
 
     if archive_trigger in ["!archive", "channel archive"] \
             or "archived to forum thread" in archive_trigger \
@@ -636,9 +1198,18 @@ class DestinationBot(commands.Bot):
         intents.reactions = True
         intents.members = True
 
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix='!', intents=intents)
         self.webhook_cache = WEBHOOKS
         self.event(self.on_ready)
+        self.event(self.on_message)
+
+    async def setup_hook(self):
+        """This is called when the bot starts up"""
+        # Sync commands to the specific guild for faster testing
+        guild = discord.Object(id=DESTINATION_SERVER_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        logging.info(f"✅ Slash commands synced to guild {DESTINATION_SERVER_ID}")
 
     async def on_ready(self):
         print(f"✅ Bot {self.user} is running!")
@@ -646,13 +1217,43 @@ class DestinationBot(commands.Bot):
         await self.ensure_webhooks()
         await self.migrate_channels_to_uncategorized()
         await self.populate_category_mappings()
+        await self.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(type=discord.ActivityType.watching, name="for slash commands")
+        )
         self.save_config()
         print("✅ Webhook setup complete. Bot is now processing messages.")
         asyncio.create_task(process_redis_messages())
-        asyncio.create_task(monitor_for_archive())
+        asyncio.create_task(monitor_dm_channels())
         asyncio.create_task(self.monitor_channels_continuously())
         asyncio.create_task(self.monitor_deleted_channels())
         asyncio.create_task(self.cleanup_expired_channels())
+
+    async def on_message(self, message):
+        """Handle messages in DM channels for relay functionality."""
+        # Skip messages from the bot itself
+        if message.author == self.user:
+            return
+
+        # Skip webhook messages
+        if message.webhook_id:
+            return
+
+        # Check if this is a DM channel that should be relayed
+        if message.channel.category and "[DM]" in message.channel.category.name:
+            if str(message.channel.id) in DM_MAPPINGS:
+                logging.info(f"📤 Relaying message from {message.author} in DM channel {message.channel.name}")
+                await relay_message_to_dm(message.channel, message)
+                return
+
+        # Process commands
+        await self.process_commands(message)
+
+    def save_config(self):
+        """Save the current configuration."""
+        config["webhooks"] = self.webhook_cache
+        config["dm_mappings"] = DM_MAPPINGS
+        save_config(config)
 
     async def migrate_channels_to_uncategorized(self):
         guild = self.get_guild(DESTINATION_SERVER_ID)
@@ -664,8 +1265,8 @@ class DestinationBot(commands.Bot):
         uncategorized_category = None
 
         for category in guild.categories:
-            # Skip if category has ignored tag
-            if any(tag in category.name for tag in ignored_tags):
+            # Skip if category has ignored tag or is a DM category
+            if any(tag in category.name for tag in ignored_tags) or "[DM]" in category.name:
                 continue
 
             # Try to extract server name tag from category
@@ -737,6 +1338,10 @@ class DestinationBot(commands.Bot):
         server_name = guild.name.lower().replace(" ", "-").replace("|", "").strip()
 
         for channel in guild.text_channels:
+            # Skip DM channels
+            if channel.category and "[DM]" in channel.category.name:
+                continue
+
             category_name = (
                 channel.category.name.lower().replace(" ", "-").replace("|", "").strip()
                 if channel.category else "uncategorized"
@@ -773,11 +1378,6 @@ class DestinationBot(commands.Bot):
             logging.error(f"❌ ERROR: Failed to create webhook in {channel.name}: {e}")
             return None
 
-    def save_config(self):
-        config["webhooks"] = self.webhook_cache
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
-
     async def cleanup_expired_channels(self):
         """Check and delete expired channels in Daily Schedule and Release Guides categories."""
         await self.wait_until_ready()
@@ -789,6 +1389,10 @@ class DestinationBot(commands.Bot):
                 current_year = current_time.year
 
                 for category in guild.categories:
+                    # Skip DM categories
+                    if "[DM]" in category.name:
+                        continue
+
                     # Daily Schedule - 24 hour expiration
                     if category.name.startswith("📅 Daily Schedule"):
                         for channel in category.channels:
@@ -886,6 +1490,10 @@ class DestinationBot(commands.Bot):
             try:
                 # 1. Sort channels in their categories
                 for category in guild.categories:
+                    # Skip DM categories
+                    if "[DM]" in category.name:
+                        continue
+
                     if category.name.startswith("📅 Release Guides"):
                         logging.info(f"📁 Found Release Guides category: '{category.name}'")
                         await self.sort_channels_in_category(category, by="date")
@@ -893,11 +1501,15 @@ class DestinationBot(commands.Bot):
                         logging.info(f"📁 Found Daily Schedule category: '{category.name}'")
                         await self.sort_channels_in_category(category, by="time")
 
-                # 2. Reroute uncategorized channels
+                # 2. Reroute uncategorized channels (skip DM channels)
                 for channel in guild.text_channels:
                     name = channel.name.lower()
                     if channel.category is not None:
                         continue  # Skip already categorized channels
+
+                    # Skip DM channels
+                    if name.startswith("dm-"):
+                        continue
 
                     # Delete divine+month
                     if any(month in name for month in months) and "divine" in name:
@@ -917,7 +1529,7 @@ class DestinationBot(commands.Bot):
                                     server_tag_match = re.search(r'\[(.*?)\]', channel.name)
                                     if server_tag_match:
                                         server_tag = server_tag_match.group(1)
-                                    source_channel_id = config["source_channel_ids"].get(server_tag)
+                                    source_channel_id = config.get("source_channel_ids", {}).get(server_tag)
                                     if source_channel_id:
                                         redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
                                     logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
@@ -934,7 +1546,7 @@ class DestinationBot(commands.Bot):
                                     server_tag_match = re.search(r'\[(.*?)\]', channel.name)
                                     if server_tag_match:
                                         server_tag = server_tag_match.group(1)
-                                    source_channel_id = config["source_channel_ids"].get(server_tag)
+                                    source_channel_id = config.get("source_channel_ids", {}).get(server_tag)
                                     if source_channel_id:
                                         redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
                                     logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
@@ -1133,6 +1745,40 @@ async def process_message(request):
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
 
+async def process_dm_relay(request):
+    """Handle DM relay requests from main.py."""
+    try:
+        relay_data = await request.json()
+        action = relay_data.get("action")
+
+        if action == "send_dm":
+            token = relay_data.get("token")
+            user_id = relay_data.get("user_id")
+            content = relay_data.get("content", "")
+            attachments = relay_data.get("attachments", [])
+
+            # Store the relay request for the appropriate self-bot
+            relay_request = {
+                "token": token,
+                "user_id": user_id,
+                "content": content,
+                "attachments": attachments,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Push to a specific Redis queue for DM relay
+            redis_client.lpush("dm_relay_queue", json.dumps(relay_request))
+            logging.info(f"✅ DM relay request queued for user {user_id}")
+
+            return web.json_response({"status": "success", "message": "DM relay queued"}, status=200)
+        else:
+            return web.json_response({"status": "error", "message": "Unknown action"}, status=400)
+
+    except Exception as e:
+        logging.error(f"❌ ERROR: Failed to process DM relay: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+
 async def start_web_server():
     app = web.Application()
     app.router.add_post("/process_message", process_message)
@@ -1140,6 +1786,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 5000)
     await site.start()
+    logging.info("🌐 Web server started on http://127.0.0.1:5000")
 
 
 async def run_bot():
@@ -1155,16 +1802,365 @@ async def run_bot():
 
 bot = DestinationBot()
 
+async def find_and_block_original_channel(channel_name, server_tag):
+    """Find the original channel and add it to exclusions."""
+    try:
+        # Get the normalized channel name
+        normalized_name = channel_name.lower().replace(" ", "-").replace("|", "")
 
-@bot.command()
-async def update(ctx, *, description):
-    updates_channel_id = config.get("updates_channel_id")
-    channel = bot.get_channel(updates_channel_id)
-    if not channel:
-        await ctx.send("❌ Updates channel not configured or not found.")
+        # Look through all monitored servers to find matching channels
+        config = load_config()
+
+        for token, token_data in config["tokens"].items():
+            if token_data.get("disabled") or token_data.get("status") == "failed":
+                continue
+
+            for server_id in token_data.get("servers", {}):
+                try:
+                    # Try to find channels in this server via bot instance
+                    if token in bot_instances:
+                        bot_instance = bot_instances[token]
+                        guild = discord.utils.get(bot_instance.guilds, id=int(server_id))
+
+                        if guild and server_tag.lower() in guild.name.lower():
+                            # Found the likely source server
+                            for channel in guild.text_channels:
+                                if channel.name.lower().replace("-", "").replace("_", "") == normalized_name.replace(
+                                        "-", "").replace("_", ""):
+                                    # Found the original channel!
+                                    success = await add_channel_to_exclusions(server_id, str(channel.id), token)
+                                    if success:
+                                        logging.info(
+                                            f"✅ Blocked channel {channel.name} (ID: {channel.id}) in server {guild.name}")
+                                        return True
+
+                except Exception as e:
+                    logging.error(f"❌ Error checking server {server_id}: {e}")
+                    continue
+
+        return False
+
+    except Exception as e:
+        logging.error(f"❌ Error in find_and_block_original_channel: {e}")
+        return False
+
+@bot.tree.command(name="ping", description="Test if the bot is responding")
+async def ping_slash(interaction: discord.Interaction):
+    """Test command - responds with Pong!"""
+    await interaction.response.send_message("🏓 Pong! Bot is working!", ephemeral=True)
+    print(f"✅ Ping command executed by {interaction.user}")
+
+
+@bot.tree.command(name="help", description="Show all available commands")
+async def help_slash(interaction: discord.Interaction):
+    """Show help for all commands"""
+    embed = discord.Embed(
+        title="🤖 1Tap Notify Bot Commands",
+        description="Available slash commands:",
+        color=discord.Color.blue()
+    )
+
+    commands_info = [
+        ("/ping", "Test if the bot is responding"),
+        ("/help", "Show this help message"),
+        ("/status", "Show bot status and configuration"),
+        ("/block", "Block a channel from being mirrored"),
+        ("/unblock", "Unblock a channel by name"),
+        ("/listblocked", "List all blocked channels"),
+        ("/dmstats", "Show DM mirroring statistics"),
+        ("/dmfilters", "Show DM filtering status"),
+        ("/update", "Post an update to the updates channel (Admin only)")
+    ]
+
+    for cmd, desc in commands_info:
+        embed.add_field(name=cmd, value=desc, inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="status", description="Show bot status and configuration")
+async def status_slash(interaction: discord.Interaction):
+    """Show bot status and configuration"""
+    embed = discord.Embed(
+        title="🤖 Bot Status",
+        color=discord.Color.green()
+    )
+
+    # Bot info
+    embed.add_field(name="Bot User", value=f"{bot.user.name}", inline=True)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
+
+    # Config info
+    embed.add_field(name="Destination Server", value=str(DESTINATION_SERVER_ID), inline=True)
+    embed.add_field(name="Webhooks", value=str(len(WEBHOOKS)), inline=True)
+    embed.add_field(name="Tokens", value=str(len(TOKENS)), inline=True)
+
+    # Redis status
+    redis_status = "✅ Connected" if redis_client else "❌ Disconnected"
+    embed.add_field(name="Redis", value=redis_status, inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="debug", description="Debug information about current channel")
+async def debug_slash(interaction: discord.Interaction):
+    """Show debug information about the current channel"""
+
+    channel = interaction.channel
+    embed = discord.Embed(
+        title="🔧 Channel Debug Information",
+        color=discord.Color.orange()
+    )
+
+    embed.add_field(name="Channel Name", value=f"`{channel.name}`", inline=False)
+    embed.add_field(name="Channel ID", value=str(channel.id), inline=True)
+    embed.add_field(name="Channel Type", value=str(channel.type), inline=True)
+    embed.add_field(name="Category", value=channel.category.name if channel.category else "None", inline=True)
+    embed.add_field(name="Server", value=channel.guild.name, inline=True)
+    embed.add_field(name="Server ID", value=str(channel.guild.id), inline=True)
+
+    # Parse info
+    base_name, server_tag = parse_channel_info(channel.name)
+    embed.add_field(name="Parsed Base Name", value=f"`{base_name}`", inline=True)
+    embed.add_field(name="Parsed Server Tag", value=f"`{server_tag}`" if server_tag else "None", inline=True)
+
+    # Show if channel follows expected format
+    has_brackets = "[" in channel.name and "]" in channel.name
+    embed.add_field(name="Has Server Tag Format", value="✅ Yes" if has_brackets else "❌ No", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="servers", description="List all monitored servers from config")
+async def servers_slash(interaction: discord.Interaction):
+    """Show all monitored servers from configuration"""
+
+    try:
+        config_data = load_config()
+        embed = discord.Embed(
+            title="🖥️ Monitored Servers",
+            description="Servers currently being monitored by the bot:",
+            color=discord.Color.blue()
+        )
+
+        # Show detected server names
+        detected_servers = get_monitored_servers()
+        if detected_servers:
+            server_list = "\n".join([f"• `{server}`" for server in detected_servers[:15]])
+            embed.add_field(
+                name="🔍 Detected Server Tags",
+                value=server_list,
+                inline=False
+            )
+
+            embed.add_field(name="📊 Total", value=f"{len(detected_servers)} server tags", inline=True)
+
+            # Show last sync time
+            last_updated = config_data.get("servers_last_updated")
+            if last_updated:
+                embed.add_field(name="🕒 Last Updated", value=last_updated[:19], inline=True)
+            else:
+                embed.add_field(name="⚠️ Status", value="No sync data found", inline=True)
+        else:
+            embed.add_field(
+                name="⚠️ No Server Names Found",
+                value="Server sync may not be working. Check main.py connection.",
+                inline=False
+            )
+
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Error Loading Servers",
+            description=f"Could not load server information: {str(e)}",
+            color=discord.Color.red()
+        )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="block", description="Block a channel from being mirrored")
+@app_commands.describe(
+    channel="The channel to block (optional - uses current channel if not specified)",
+    server_tag="Manual server tag if auto-detection fails (e.g., 'ak-chefs', 'divine')"
+)
+async def block_slash(interaction: discord.Interaction, channel: discord.TextChannel = None, server_tag: str = None):
+    """Block a channel from being mirrored"""
+
+    # Check permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.",
+                                                ephemeral=True)
         return
 
-    version = get_next_version()
+    # Use current channel if none specified
+    target_channel = channel or interaction.channel
+
+    # Try to parse channel info
+    base_name, detected_server_tag = parse_channel_info_fixed(target_channel.name)
+
+    # Use manual server tag if provided, otherwise use detected
+    final_server_tag = server_tag or detected_server_tag
+
+    embed = discord.Embed(
+        title="🔍 Channel Block Analysis",
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(name="Channel", value=f"{target_channel.mention}\n`{target_channel.name}`", inline=False)
+    embed.add_field(name="Auto-detected Server", value=f"`{detected_server_tag}`" if detected_server_tag else "❌ None",
+                    inline=True)
+    embed.add_field(name="Manual Server Tag", value=f"`{server_tag}`" if server_tag else "Not provided", inline=True)
+    embed.add_field(name="Final Server Tag", value=f"`{final_server_tag}`" if final_server_tag else "❌ None",
+                    inline=True)
+
+    if final_server_tag:
+        embed.add_field(name="✅ Block Status", value=f"Ready to block from server: `{final_server_tag}`", inline=False)
+        embed.add_field(name="Would Block", value=f"Channel: `{base_name}`\nFrom server: `{final_server_tag}`",
+                        inline=False)
+        embed.color = discord.Color.green()
+        embed.title = "✅ Channel Ready to Block"
+
+        # Add actual blocking logic here
+        # success = await add_channel_to_exclusions(server_id, target_channel.id, token)
+
+    else:
+        suggestions = get_channel_suggestions(target_channel.name)
+        embed.add_field(name="❌ Cannot Auto-Detect Server", value="Please specify server tag manually", inline=False)
+
+        if suggestions:
+            embed.add_field(name="💡 Suggested Server Tags", value="\n".join([f"• `{tag}`" for tag in suggestions]),
+                            inline=False)
+            embed.add_field(name="Usage Example", value=f"`/block server_tag:{suggestions[0]}`", inline=False)
+
+        embed.color = discord.Color.orange()
+        embed.title = "⚠️ Manual Server Tag Required"
+
+    embed.set_footer(text="Note: Actual blocking logic would be implemented in a full version")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="unblock", description="Unblock a channel by name")
+@app_commands.describe(channel_name="The name of the channel to unblock")
+async def unblock_slash(interaction: discord.Interaction, channel_name: str):
+    """Unblock a channel by name"""
+
+    # Check permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.",
+                                                ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="✅ Channel Unblock Request",
+        description=f"Channel `{channel_name}` would be unblocked.",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Note: Full unblocking logic not implemented in this demo")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="listblocked", description="List all blocked channels")
+async def listblocked_slash(interaction: discord.Interaction):
+    """List all blocked channels"""
+
+    # Check permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.",
+                                                ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🚫 Blocked Channels",
+        description="No channels are currently blocked.",
+        color=discord.Color.orange()
+    )
+
+    # Add logic here to load from config and show actual blocked channels
+    embed.set_footer(text="Note: This would show actual blocked channels from config.json")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="dmstats", description="Show DM mirroring statistics")
+async def dmstats_slash(interaction: discord.Interaction):
+    """Show DM mirroring statistics"""
+    embed = discord.Embed(
+        title="📨 DM Mirroring Statistics",
+        color=discord.Color.blue()
+    )
+
+    total_mappings = len(DM_MAPPINGS)
+    active_channels = 0
+
+    guild = bot.get_guild(DESTINATION_SERVER_ID)
+    if guild:
+        for category in guild.categories:
+            if "[DM]" in category.name:
+                active_channels += len([c for c in category.channels if isinstance(c, discord.TextChannel)])
+
+    embed.add_field(name="Total DM Mappings", value=str(total_mappings), inline=True)
+    embed.add_field(name="Active DM Channels", value=str(active_channels), inline=True)
+    embed.add_field(name="DM Categories",
+                    value=str(len([c for c in guild.categories if "[DM]" in c.name]) if guild else 0), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="dmfilters", description="Show DM filtering status")
+async def dmfilters_slash(interaction: discord.Interaction):
+    """Show current DM filtering status"""
+    embed = discord.Embed(
+        title="🛡️ DM Filtering Status",
+        color=discord.Color.green()
+    )
+
+    embed.add_field(
+        name="Spam Filter",
+        value="✅ Active - Blocks messages with spam keywords",
+        inline=False
+    )
+    embed.add_field(
+        name="Friend Request Filter",
+        value="✅ Active - Blocks DMs from users with no mutual servers",
+        inline=False
+    )
+    embed.add_field(
+        name="Bot Filter",
+        value="✅ Active - Only allows specific whitelisted bots",
+        inline=False
+    )
+    embed.add_field(
+        name="Allowed Bots",
+        value="Zebra Check, Divine Monitor, Hidden Clearance Bot, etc.",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="update", description="Post an update to the updates channel")
+@app_commands.describe(description="The update description to post")
+async def update_slash(interaction: discord.Interaction, description: str):
+    """Post an update to the updates channel"""
+
+    # Check permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need administrator permissions to use this command.",
+                                                ephemeral=True)
+        return
+
+    updates_channel_id = config.get("updates_channel_id")
+
+    if not updates_channel_id:
+        await interaction.response.send_message("❌ Updates channel not configured in config.json.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(updates_channel_id)
+    if not channel:
+        await interaction.response.send_message("❌ Updates channel not found.", ephemeral=True)
+        return
+
+    # Simple version increment
+    version = "1.0"  # You can implement get_next_version() if needed
     timestamp = datetime.now().strftime("%b %d, %Y | %H:%M:%S")
 
     embed = discord.Embed(
@@ -1174,9 +2170,11 @@ async def update(ctx, *, description):
     )
     embed.set_footer(text=f"Update {version} | 1Tap Notify [{timestamp}]")
 
-    await channel.send(embed=embed)
-    await ctx.send("✅ Update posted.")
-
+    try:
+        await channel.send(embed=embed)
+        await interaction.response.send_message("✅ Update posted successfully!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to post update: {str(e)}", ephemeral=True)
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

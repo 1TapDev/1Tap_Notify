@@ -2270,14 +2270,18 @@ async def update_slash(interaction: discord.Interaction, description: str):
         await interaction.response.send_message("❌ Updates channel not found.", ephemeral=True)
         return
 
-    # Simple version increment
-    version = "1.0"  # You can implement get_next_version() if needed
+    # Get next version number
+    version = get_next_version()
     timestamp = datetime.now().strftime("%b %d, %Y | %H:%M:%S")
 
+    # Format the description with proper line breaks, bullets, and indentation
+    # Add bullet to the first item and proper spacing
+    formatted_desc = f"    • {description}".replace(" - ", "\n    • ").replace("Result:", "\n\n**Result:**")
+
     embed = discord.Embed(
-        title="🔔 New update!",
-        description=description.strip(),
-        color=discord.Color.blurple()
+        title="⚠️ New update!",
+        description=f"🔧 **Bot Cleanup Update Improvements:**\n\n{formatted_desc}",
+        color=0xFFD700  # Gold color
     )
     embed.set_footer(text=f"Update {version} | 1Tap Notify [{timestamp}]")
 

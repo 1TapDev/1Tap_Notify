@@ -38,13 +38,20 @@ logging.basicConfig(
 
 # Configure console to only show errors
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.ERROR)
+console_handler.setLevel(logging.WARNING)  # Only WARNING and above
 console_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 console_handler.setFormatter(console_formatter)
 logging.getLogger().addHandler(console_handler)
 
 # Load configuration from config.json
 CONFIG_FILE = "config.json"
+
+# Connection state tracking
+connection_state = {
+    "is_connected": True,
+    "last_disconnect_logged": False,
+    "reconnect_attempts": 0
+}
 
 def load_config():
     """Load configuration from config.json file."""
@@ -892,7 +899,7 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
 
 
 async def send_to_webhook(message_data):
-    """Fixed send_to_webhook function for bot.py"""
+    """Fixed send_to_webhook function for bot.py with improved reply formatting"""
     message_id = message_data.get("message_id")
 
     # Skip processing if channel was deleted
@@ -981,12 +988,15 @@ async def send_to_webhook(message_data):
         content = f"{forwarded_text}{content}" if content else forwarded_text
         logging.info(f"🔄 Processing forwarded message from {forwarded_from}")
 
-    # Handle replies
+    # Handle replies with gray bar format (OLD FORMAT)
     if message_data.get("reply_to") and message_data.get("reply_text"):
-        reply_header = f"💬 **Replying to {message_data['reply_to']}:** {message_data['reply_text']}\n"
+        # Create a gray bar effect using Discord's quote formatting
+        reply_lines = message_data['reply_text'].split('\n')
+        quoted_reply = '\n'.join([f"> {line}" for line in reply_lines])
+        reply_header = f"> **{message_data['reply_to']}**\n{quoted_reply}\n"
         content = f"{reply_header}{content}"
     elif message_data.get("reply_to"):
-        reply_header = f"💬 **Replying to {message_data['reply_to']}**\n"
+        reply_header = f"> **{message_data['reply_to']}**\n"
         content = f"{reply_header}{content}"
 
     # Handle attachments (include forwarded attachments)
@@ -1131,6 +1141,20 @@ async def send_to_webhook(message_data):
                                 retry_after = error_data.get("retry_after", 1)
                                 await asyncio.sleep(retry_after)
                                 continue
+                            elif response.status == 404:
+                                error_data = await response.text()
+                                if "Unknown Webhook" in error_data:
+                                    logging.info(f"Unknown webhook detected for {webhook_key}, removing from config")
+                                    WEBHOOKS.pop(webhook_key, None)
+                                    redis_client.hdel("webhooks", webhook_key)
+                                    bot.save_config()
+                                    return
+                                else:
+                                    logging.error(f"❌ Webhook 404: {error_data}")
+                                    return
+                            elif response.status == 413:
+                                logging.info(f"Request too large for webhook, skipping message")
+                                return
                             elif response.status == 400:
                                 error_data = await response.text()
                                 if "30005" in error_data:  # Role limit error
@@ -1153,6 +1177,20 @@ async def send_to_webhook(message_data):
                                 retry_after = error_data.get("retry_after", 1)
                                 await asyncio.sleep(retry_after)
                                 continue
+                            elif response.status == 404:
+                                error_data = await response.text()
+                                if "Unknown Webhook" in error_data:
+                                    logging.info(f"Unknown webhook detected for {webhook_key}, removing from config")
+                                    WEBHOOKS.pop(webhook_key, None)
+                                    redis_client.hdel("webhooks", webhook_key)
+                                    bot.save_config()
+                                    return
+                                else:
+                                    logging.error(f"❌ Webhook 404: {error_data}")
+                                    return
+                            elif response.status == 413:
+                                logging.info(f"Request too large for webhook, skipping message")
+                                return
                             elif response.status == 400:
                                 error_data = await response.text()
                                 if "30005" in error_data:  # Role limit error
@@ -1171,12 +1209,26 @@ async def send_to_webhook(message_data):
                                 return
 
                 except Exception as e:
-                    logging.error(f"❌ Exception during webhook attempt {attempt + 1}: {e}")
+                    # Only log connection-related errors if we haven't logged them recently
+                    if "Server disconnected" in str(e) or "getaddrinfo failed" in str(e) or "semaphore timeout" in str(
+                            e).lower():
+                        if not connection_state["last_disconnect_logged"]:
+                            print("🔴 Disconnected from Discord")
+                            connection_state["last_disconnect_logged"] = True
+                            connection_state["is_connected"] = False
+                    else:
+                        logging.error(f"❌ Exception during webhook attempt {attempt + 1}: {e}")
+
                     if attempt < 2:
                         await asyncio.sleep(2 * (attempt + 1))
 
             if not success:
-                logging.error(f"❌ Failed to send webhook message part {part_idx + 1}")
+                # Only log major failures, not routine network issues
+                try:
+                    if not any(keyword in str(e).lower() for keyword in ["timeout", "connection", "dns", "ssl"]):
+                        logging.error(f"❌ Failed to send webhook message part {part_idx + 1}")
+                except:
+                    logging.error(f"❌ Failed to send webhook message part {part_idx + 1}")
 
             if len(content_parts) > 1 and part_idx < len(content_parts) - 1:
                 await asyncio.sleep(0.5)
@@ -1228,6 +1280,15 @@ class DestinationBot(commands.Bot):
         logging.info(f"✅ Slash commands synced to guild {DESTINATION_SERVER_ID}")
 
     async def on_ready(self):
+        global connection_state
+
+        # Handle reconnection messaging
+        if not connection_state["is_connected"]:
+            print("🟢 Reconnected to Discord")
+            connection_state["is_connected"] = True
+            connection_state["last_disconnect_logged"] = False
+            connection_state["reconnect_attempts"] = 0
+
         print(f"✅ Bot {self.user} is running!")
         self.webhook_cache = redis_client.hgetall("webhooks")
         await self.ensure_webhooks()
@@ -1244,6 +1305,14 @@ class DestinationBot(commands.Bot):
         asyncio.create_task(self.monitor_channels_continuously())
         asyncio.create_task(self.monitor_deleted_channels())
         asyncio.create_task(self.cleanup_expired_channels())
+
+    async def on_disconnect(self):
+        """Handle disconnect events"""
+        global connection_state
+        if connection_state["is_connected"]:
+            print("🔴 Disconnected from Discord")
+            connection_state["is_connected"] = False
+            connection_state["last_disconnect_logged"] = True
 
     async def on_message(self, message):
         """Handle messages in DM channels for relay functionality."""
@@ -1436,7 +1505,9 @@ class DestinationBot(commands.Bot):
                                         logging.info(
                                             f"🗑️ Deleted expired daily channel: {channel.name} (age: {time_elapsed})")
                                     except Exception as e:
-                                        logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
+                                        # Silently handle 404 errors for expired channels
+                                        if "404" not in str(e) and "Unknown Channel" not in str(e):
+                                            logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
 
                     # Release Guides - 7 days expiration or past date
                     elif category.name.startswith("📅 Release Guides"):

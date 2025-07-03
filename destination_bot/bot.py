@@ -792,6 +792,8 @@ async def relay_message_to_dm(channel, message):
 
 
 async def clean_mentions(content: str, destination_guild: discord.Guild, message_data: dict) -> str:
+    """Enhanced mention cleaning with role limit protection"""
+
     # Replace <#channel_id> with destination channel or fallback text
     channel_mentions = re.findall(r"<#(\d+)>", content)
     for channel_id in channel_mentions:
@@ -799,16 +801,13 @@ async def clean_mentions(content: str, destination_guild: discord.Guild, message
         original_name = message_data.get("channel_real_name", f"channel-{channel_id}")
         server_name = message_data.get("server_real_name", "Unknown Server")
 
-        # Find a matching channel in the destination server by name
         matching_channel = discord.utils.get(destination_guild.text_channels, name=original_name)
         if matching_channel:
-            # Replace with clickable destination channel
             content = content.replace(f"<#{channel_id}>", f"<#{matching_channel.id}>")
         else:
-            # Replace with fallback text
             content = content.replace(f"<#{channel_id}>", f"`{server_name} > #{original_name}`")
 
-    # Replace <@user_id> with @username#discriminator
+    # Replace <@user_id> with @username
     user_mentions = re.findall(r"<@!?(\d+)>", content)
     for user_id in user_mentions:
         try:
@@ -818,31 +817,15 @@ async def clean_mentions(content: str, destination_guild: discord.Guild, message
         except Exception:
             content = content.replace(f"<@{user_id}>", "@unknown")
 
-    # Replace <@&role_id> with matching role in destination or create it
+    # FIXED ROLE HANDLING - Always use text mentions to avoid role limit
     role_mentions = re.findall(r"<@&(\d+)>", content)
     source_role_map = message_data.get("mentioned_roles", {})
 
     for role_id in role_mentions:
-        role_name = source_role_map.get(role_id, f"AutoRole-{role_id}")
-        dest_role = discord.utils.get(destination_guild.roles, name=role_name)
+        role_name = source_role_map.get(role_id, f"Role-{role_id}")
 
-        if not dest_role:
-            # Create based on MEMBERS
-            base_role = discord.utils.get(destination_guild.roles, name="MEMBERS")
-            if base_role:
-                dest_role = await destination_guild.create_role(
-                    name=role_name,
-                    permissions=base_role.permissions,
-                    color=base_role.color,
-                    hoist=False,
-                    mentionable=True
-                )
-                logging.info(f"✅ Created role '{role_name}' based on MEMBERS")
-            else:
-                content = content.replace(f"<@&{role_id}>", f"@{role_name}")
-                continue
-
-        content = content.replace(f"<@&{role_id}>", f"<@&{dest_role.id}>")
+        # Always use text mention to avoid hitting role limit
+        content = content.replace(f"<@&{role_id}>", f"**@{role_name}**")
 
     return content
 
@@ -909,21 +892,21 @@ async def resolve_embed_mentions(embed: dict, guild: discord.Guild, message_data
 
 
 async def send_to_webhook(message_data):
+    """Fixed send_to_webhook function for bot.py"""
     message_id = message_data.get("message_id")
 
-    # If channel was previously deleted due to Polar Helper, skip further processing
+    # Skip processing if channel was deleted
     if message_data["channel_id"] in polar_deleted_channels:
         logging.info(f"⏭️ Skipping message for deleted channel {message_data['channel_id']} (Polar Helper triggered)")
         return
 
-    # Auto-delete if archive command detected
+    # Archive detection and handling (existing logic)
     archive_trigger = message_data.get("content", "").strip().lower()
     embed_title = (message_data.get("embed_title") or "").lower()
     embed_desc = (message_data.get("embed_description") or "").lower()
-
     author_username = message_data.get("author_name", "")
 
-    # Polar Helper special archive logic
+    # Polar Helper logic (existing)
     if author_username == "Polar Helper#6493" and (
             "channel archive" in embed_title or "channel archive" in embed_desc or archive_trigger == "channel archive"
     ):
@@ -936,10 +919,9 @@ async def send_to_webhook(message_data):
                     f"🗑️ Deleted channel '{channel_obj.name}' (ID: {channel_obj.id}) triggered by Polar Helper")
             except Exception as e:
                 logging.error(f"❌ Failed to delete channel '{channel_obj.name}': {e}")
-        else:
-            logging.warning(
-                f"⚠️ Channel not found in cache for Polar Helper archive delete: {message_data['channel_id']}")
+        return
 
+    # Archive command detection (existing)
     if archive_trigger in ["!archive", "channel archive"] \
             or "archived to forum thread" in archive_trigger \
             or "channel archive" in embed_title \
@@ -952,15 +934,16 @@ async def send_to_webhook(message_data):
                 logging.info(f"🗑️ Deleted channel '{channel_obj.name}' (ID: {channel_obj.id})")
             except Exception as e:
                 logging.error(f"❌ Failed to delete channel '{channel_obj.name}': {e}")
-        else:
-            logging.warning(f"⚠️ Channel not found in cache for archive delete: {message_data['channel_id']}")
+        return
 
+    # Duplicate detection (existing)
     if message_id in recent_message_ids:
         return
     recent_message_ids.add(message_id)
     if len(recent_message_ids) > 1000:
         recent_message_ids.pop()
 
+    # Get webhook
     raw_cat = message_data.get("category_name", "uncategorized").strip()
     raw_srv = message_data.get("server_name", "Unknown Server").strip()
     raw_chan = message_data["channel_name"].strip()
@@ -974,37 +957,52 @@ async def send_to_webhook(message_data):
     if not webhook_url:
         webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
         if not webhook_url:
+            logging.error(f"❌ Could not create webhook for {webhook_key}")
             return
 
-    content = await clean_mentions(
-        message_data.get("content", ""),
-        bot.get_guild(DESTINATION_SERVER_ID),
-        message_data
-    )
+    # Clean content with enhanced mention handling
+    try:
+        content = await clean_mentions(
+            message_data.get("content", ""),
+            bot.get_guild(DESTINATION_SERVER_ID),
+            message_data
+        )
+    except Exception as e:
+        logging.error(f"❌ Error cleaning mentions: {e}")
+        content = message_data.get("content", "")
 
-    forwarded_text = f"> **Forwarded from @{message_data['forwarded_from']}**" if message_data.get(
-        "forwarded_from") else ""
-    if forwarded_text:
-        content = f"{forwarded_text}\n{content}"
+    # Handle forwarded messages - IMPROVED FORMATTING
+    forwarded_from = message_data.get("forwarded_from")
+    forwarded_attachments = message_data.get("forwarded_attachments", [])
 
+    if forwarded_from:
+        # Better forwarded message formatting
+        forwarded_text = f"📤 **Forwarded from:** {forwarded_from}\n"
+        content = f"{forwarded_text}{content}" if content else forwarded_text
+        logging.info(f"🔄 Processing forwarded message from {forwarded_from}")
+
+    # Handle replies
     if message_data.get("reply_to") and message_data.get("reply_text"):
-        content = f"> **Replying to @{message_data['reply_to']}:** {message_data['reply_text']}\n{content}"
+        reply_header = f"💬 **Replying to {message_data['reply_to']}:** {message_data['reply_text']}\n"
+        content = f"{reply_header}{content}"
     elif message_data.get("reply_to"):
-        content = f"> **Replying to @{message_data['reply_to']}**\n{content}"
+        reply_header = f"💬 **Replying to {message_data['reply_to']}**\n"
+        content = f"{reply_header}{content}"
 
+    # Handle attachments (include forwarded attachments)
     attachments = message_data.get("attachments", [])
-    embeds = message_data.get("embeds", [])
-    if not embeds:
-        logging.warning(f"⚠️ No embeds received from main.py → message_id={message_id}")
+    if forwarded_attachments:
+        attachments.extend(forwarded_attachments)
+        logging.info(f"📎 Including {len(forwarded_attachments)} forwarded attachments")
 
+    # Handle embeds
+    embeds = message_data.get("embeds", [])
     cleaned_embeds = []
     for embed in embeds:
         if not isinstance(embed, dict):
             continue
         try:
             embed_copy = embed.copy()
-
-            # Check if embed has any meaningful field
             if not any([
                 embed_copy.get("title"),
                 embed_copy.get("description"),
@@ -1013,31 +1011,14 @@ async def send_to_webhook(message_data):
                 embed_copy.get("thumbnail"),
                 embed_copy.get("fields")
             ]):
-                logging.warning(f"⚠️ Embed skipped due to missing core fields:\n{json.dumps(embed_copy, indent=2)}")
                 continue
 
-            core_fields = [
-                embed_copy.get("title"),
-                embed_copy.get("description"),
-                embed_copy.get("url"),
-                embed_copy.get("image", {}).get("url") if isinstance(embed_copy.get("image"), dict) else embed_copy.get(
-                    "image"),
-                embed_copy.get("thumbnail", {}).get("url") if isinstance(embed_copy.get("thumbnail"),
-                                                                         dict) else embed_copy.get("thumbnail"),
-                embed_copy.get("fields")
-            ]
-            if not any(core_fields):
-                logging.warning(f"⚠️ Embed skipped due to missing core fields:\n{json.dumps(embed_copy, indent=2)}")
-                continue
-
-            # Clean malformed image field if needed
             if "image" in embed_copy:
                 if isinstance(embed_copy["image"], str):
                     embed_copy["image"] = {"url": embed_copy["image"]}
                 elif isinstance(embed_copy["image"], dict) and "url" not in embed_copy["image"]:
                     embed_copy.pop("image")
 
-            # Remove empty fields
             for key in list(embed_copy.keys()):
                 if embed_copy[key] is None:
                     del embed_copy[key]
@@ -1048,17 +1029,46 @@ async def send_to_webhook(message_data):
         except Exception as e:
             logging.warning(f"❌ Embed processing failed: {e}")
 
-    files = []
-    # ⏭️ Skip truly empty messages (no content, no embeds, no attachments)
+    # Skip empty messages
     if not content.strip() and not cleaned_embeds and not attachments:
-        logging.info(
-            f"⏭️ Skipped empty message_id={message_data.get('message_id')} from {message_data.get('author_name')}")
         return
 
-    # Split message if over 2000 characters
-    parts = [content[i:i + 2000] for i in range(0, len(content), 2000)] if content else [""]
+    # Smart content splitting
+    def smart_split_content(text, max_length=1900):
+        if len(text) <= max_length:
+            return [text]
 
-    # Download attachments to files (if any)
+        parts = []
+        current_part = ""
+        lines = text.split('\n')
+
+        for line in lines:
+            if len(current_part) + len(line) + 1 > max_length:
+                if current_part:
+                    parts.append(current_part.strip())
+                    current_part = ""
+
+                if len(line) > max_length:
+                    words = line.split(' ')
+                    for word in words:
+                        if len(current_part) + len(word) + 1 > max_length:
+                            if current_part:
+                                parts.append(current_part.strip())
+                                current_part = ""
+                        current_part += f" {word}" if current_part else word
+                else:
+                    current_part = line
+            else:
+                current_part += f"\n{line}" if current_part else line
+
+        if current_part:
+            parts.append(current_part.strip())
+
+        return parts
+
+    content_parts = smart_split_content(content) if content else [""]
+
+    # Download attachments
     files = []
     for idx, url in enumerate(attachments):
         try:
@@ -1078,47 +1088,32 @@ async def send_to_webhook(message_data):
         except Exception as e:
             logging.warning(f"⚠️ Failed to fetch attachment: {url} → {e}")
 
+    # Send webhook with enhanced error handling
     async with aiohttp.ClientSession() as session:
-        for part in parts:
+        for part_idx, part in enumerate(content_parts):
+            success = False
             for attempt in range(3):
                 try:
                     avatar_url = message_data.get("author_avatar")
+                    username = message_data.get("author_name", "Unknown")
 
                     payload = {
-                        "username": message_data.get("author_name", "Unknown"),
+                        "username": username,
                         "avatar_url": avatar_url
                     }
 
-                    if content:
-                        payload["content"] = content
+                    if part:
+                        payload["content"] = part
 
-                    if embeds:
-                        payload["embeds"] = embeds
-
-                    if "embeds" in payload:
-                        logging.info(f"📤 Embeds included in payload: {json.dumps(payload['embeds'], indent=2)}")
-                    else:
-                        logging.warning("⚠️ Embeds were NOT included in final payload")
-
-                    if files:
-                        logging.info(f"📤 With files: {[f['filename'] for f in files]}")
-
-                    if not payload.get("content"):
-                        payload.pop("content", None)
-
-                    if part == parts[0] and cleaned_embeds:
+                    if part_idx == 0 and cleaned_embeds:
                         payload["embeds"] = cleaned_embeds
-                    else:
-                        payload.pop("embeds", None)
 
-                    # If message only has image attachments, treat as file upload instead of just an embed
-                    if not content.strip() and not cleaned_embeds and files:
-                        parts = [""]  # Force sending file even if no text or embed
+                    files_to_send = files if part_idx == 0 else None
 
-                    if files:
+                    if files_to_send:
                         from aiohttp import FormData
                         form = FormData()
-                        for idx, file in enumerate(files):
+                        for idx, file in enumerate(files_to_send):
                             form.add_field(
                                 name=f"file{idx}",
                                 value=file["data"],
@@ -1129,66 +1124,87 @@ async def send_to_webhook(message_data):
 
                         async with session.post(webhook_url, data=form) as response:
                             if response.status in (200, 204):
-                                logging.info(f"✅ Webhook message sent successfully to {webhook_url}")
-                                break  # only break on success
-                            elif response.status == 404:
-                                error_text = await response.text()
-                                logging.error(f"❌ Webhook 404: {error_text}")
-                                if "Unknown Webhook" in error_text:
-                                    logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Removing from config.")
-                                    WEBHOOKS.pop(webhook_key, None)
-                                    redis_client.hdel("webhooks", webhook_key)
-                                    bot.save_config()
-                                    webhook_url = await create_channel_and_webhook(category_name, channel_name,
-                                                                                   server_name)
-                                    if not webhook_url:
-                                        return
-                                elif "Unknown Channel" in error_text:
-                                    logging.warning(
-                                        f"⚠️ Channel '{channel_name}' no longer exists. Removing webhook + config for {webhook_key}.")
-                                    WEBHOOKS.pop(webhook_key, None)
-                                    redis_client.hdel("webhooks", webhook_key)
-                                    bot.save_config()
+                                success = True
+                                break
+                            elif response.status == 429:
+                                error_data = await response.json()
+                                retry_after = error_data.get("retry_after", 1)
+                                await asyncio.sleep(retry_after)
+                                continue
+                            elif response.status == 400:
+                                error_data = await response.text()
+                                if "30005" in error_data:  # Role limit error
+                                    logging.error(f"❌ Role limit reached, message skipped")
                                     return
-                            elif response.status >= 500:
-                                logging.warning(f"⚠️ Discord error {response.status}, retry {attempt + 1}")
-                                await asyncio.sleep(2 * (attempt + 1))
+                                else:
+                                    logging.error(f"❌ Bad request: {error_data}")
+                                    return
                             else:
                                 error = await response.text()
-                                logging.error(f"❌ Webhook file upload failed ({response.status}) → {error}")
+                                logging.error(f"❌ Webhook failed ({response.status}): {error}")
                                 return
-
-                    # Fallback: JSON post without file
-                    async with session.post(webhook_url, json=payload) as response:
-                        if response.status in (200, 204):
-                            break
-                        elif response.status == 404:
-                            error_text = await response.text()
-                            if "Unknown Webhook" in error_text:
-                                logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Removing from config.")
-                                WEBHOOKS.pop(webhook_key, None)
-                                redis_client.hdel("webhooks", webhook_key)
-                                bot.save_config()
-                                webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
-                                if not webhook_url:
+                    else:
+                        async with session.post(webhook_url, json=payload) as response:
+                            if response.status in (200, 204):
+                                success = True
+                                break
+                            elif response.status == 429:
+                                error_data = await response.json()
+                                retry_after = error_data.get("retry_after", 1)
+                                await asyncio.sleep(retry_after)
+                                continue
+                            elif response.status == 400:
+                                error_data = await response.text()
+                                if "30005" in error_data:  # Role limit error
+                                    logging.error(f"❌ Role limit reached, message skipped")
                                     return
-                            elif "Unknown Channel" in error_text:
-                                logging.warning(
-                                    f"⚠️ Channel '{channel_name}' no longer exists. Removing webhook + config for {webhook_key}.")
-                                WEBHOOKS.pop(webhook_key, None)
-                                redis_client.hdel("webhooks", webhook_key)
-                                bot.save_config()
+                                elif "Must be 2000 or fewer in length" in error_data:
+                                    if len(payload.get("content", "")) > 1900:
+                                        payload["content"] = payload["content"][:1900] + "..."
+                                        continue
+                                else:
+                                    logging.error(f"❌ Bad request: {error_data}")
+                                    return
+                            else:
+                                error = await response.text()
+                                logging.error(f"❌ Webhook failed ({response.status}): {error}")
                                 return
-                        elif response.status >= 500:
-                            logging.warning(f"⚠️ Discord error {response.status}, retry {attempt + 1}")
-                            await asyncio.sleep(2 * (attempt + 1))
-                        else:
-                            logging.error(f"❌ Webhook failed ({response.status}) → {await response.text()}")
-                            return
-                except Exception as e:
-                    logging.error(f"❌ Exception during webhook post: {e}")
-                    await asyncio.sleep(2 * (attempt + 1))
 
+                except Exception as e:
+                    logging.error(f"❌ Exception during webhook attempt {attempt + 1}: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
+
+            if not success:
+                logging.error(f"❌ Failed to send webhook message part {part_idx + 1}")
+
+            if len(content_parts) > 1 and part_idx < len(content_parts) - 1:
+                await asyncio.sleep(0.5)
+
+async def handle_webhook_error(self, response, webhook_key, category_name, channel_name, server_name):
+    """Handle webhook errors more gracefully"""
+    if response.status == 404:
+        error_text = await response.text()
+        logging.error(f"❌ Webhook 404: {error_text}")
+        if "Unknown Webhook" in error_text:
+            logging.warning(f"⚠️ Webhook deleted for {webhook_key}. Removing from config.")
+            WEBHOOKS.pop(webhook_key, None)
+            redis_client.hdel("webhooks", webhook_key)
+            self.save_config()
+            webhook_url = await create_channel_and_webhook(category_name, channel_name, server_name)
+            return webhook_url
+        elif "Unknown Channel" in error_text:
+            logging.warning(f"⚠️ Channel '{channel_name}' no longer exists. Removing webhook + config for {webhook_key}.")
+            WEBHOOKS.pop(webhook_key, None)
+            redis_client.hdel("webhooks", webhook_key)
+            self.save_config()
+            return None
+    elif response.status >= 500:
+        logging.warning(f"⚠️ Discord error {response.status}, will retry")
+    else:
+        error = await response.text()
+        logging.error(f"❌ Webhook failed ({response.status}) → {error}")
+    return None
 
 class DestinationBot(commands.Bot):
     def __init__(self):
@@ -1488,30 +1504,26 @@ class DestinationBot(commands.Bot):
 
         while not self.is_closed():
             try:
-                # 1. Sort channels in their categories
+                # Sort channels in their categories
                 for category in guild.categories:
-                    # Skip DM categories
                     if "[DM]" in category.name:
                         continue
 
                     if category.name.startswith("📅 Release Guides"):
-                        logging.info(f"📁 Found Release Guides category: '{category.name}'")
                         await self.sort_channels_in_category(category, by="date")
                     elif category.name.startswith("📅 Daily Schedule"):
-                        logging.info(f"📁 Found Daily Schedule category: '{category.name}'")
                         await self.sort_channels_in_category(category, by="time")
 
-                # 2. Reroute uncategorized channels (skip DM channels)
+                # Reroute uncategorized channels with FIXED server tag extraction
                 for channel in guild.text_channels:
                     name = channel.name.lower()
                     if channel.category is not None:
-                        continue  # Skip already categorized channels
+                        continue
 
-                    # Skip DM channels
                     if name.startswith("dm-"):
                         continue
 
-                    # Delete divine+month
+                    # Delete divine+month channels
                     if any(month in name for month in months) and "divine" in name:
                         try:
                             await channel.delete(reason="Month + divine based channel deleted")
@@ -1520,39 +1532,67 @@ class DestinationBot(commands.Bot):
                         except Exception as e:
                             logging.error(f"❌ Failed to delete '{channel.name}': {e}")
 
-                    # Time reroute
-                    if re.search(r"\b\d{1,2}(am|pm)\b", name):
-                        for cat in guild.categories:
-                            if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
-                                try:
-                                    await channel.edit(category=cat)
-                                    server_tag_match = re.search(r'\[(.*?)\]', channel.name)
-                                    if server_tag_match:
-                                        server_tag = server_tag_match.group(1)
-                                    source_channel_id = config.get("source_channel_ids", {}).get(server_tag)
-                                    if source_channel_id:
-                                        redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
-                                    logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
-                                except Exception as e:
-                                    logging.error(f"❌ Could not move '{channel.name}' to Daily Schedule: {e}")
-                                break
+                    # FIXED server tag extraction - Initialize server_tag properly
+                    server_tag = None
 
-                    # Date reroute
-                    elif re.search(r"\b\d{1,2}-\d{1,2}\b", name):
-                        for cat in guild.categories:
-                            if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
-                                try:
-                                    await channel.edit(category=cat)
-                                    server_tag_match = re.search(r'\[(.*?)\]', channel.name)
-                                    if server_tag_match:
-                                        server_tag = server_tag_match.group(1)
-                                    source_channel_id = config.get("source_channel_ids", {}).get(server_tag)
-                                    if source_channel_id:
-                                        redis_client.hset("channel_monitoring", str(channel.id), str(source_channel_id))
-                                    logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
-                                except Exception as e:
-                                    logging.error(f"❌ Could not move '{channel.name}' to Release Guides: {e}")
-                                break
+                    try:
+                        # Method 1: Extract from [brackets] in channel name
+                        import re
+                        bracket_match = re.search(r'\[(.*?)\]', channel.name)
+                        if bracket_match:
+                            server_tag = bracket_match.group(1)
+
+                        # Method 2: Extract from end of channel name (common patterns)
+                        if not server_tag:
+                            common_servers = ["divine", "polar-chefs", "fastbreak", "ak-chefs", "gfnf", "shoeplex"]
+                            for server in common_servers:
+                                if name.endswith(f"-{server}") or name.endswith(server):
+                                    server_tag = server
+                                    break
+
+                        # Time-based channel routing
+                        if re.search(r"\b\d{1,2}(am|pm)\b", name):
+                            for cat in guild.categories:
+                                if cat.name.startswith("📅 Daily Schedule") and cat.name.endswith("]"):
+                                    try:
+                                        await channel.edit(category=cat)
+
+                                        # Store source channel mapping if server tag found
+                                        if server_tag:
+                                            source_channel_id = config.get("source_channel_ids", {}).get(server_tag)
+                                            if source_channel_id:
+                                                redis_client.hset("channel_monitoring", str(channel.id),
+                                                                  str(source_channel_id))
+
+                                        logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
+                                        break  # Exit the category loop
+                                    except Exception as e:
+                                        logging.error(f"❌ Could not move '{channel.name}' to Daily Schedule: {e}")
+                                    break  # Exit the category loop even if error
+
+                        # Date-based channel routing
+                        elif re.search(r"\b\d{1,2}-\d{1,2}\b", name):
+                            for cat in guild.categories:
+                                if cat.name.startswith("📅 Release Guides") and cat.name.endswith("]"):
+                                    try:
+                                        await channel.edit(category=cat)
+
+                                        # Store source channel mapping if server tag found
+                                        if server_tag:
+                                            source_channel_id = config.get("source_channel_ids", {}).get(server_tag)
+                                            if source_channel_id:
+                                                redis_client.hset("channel_monitoring", str(channel.id),
+                                                                  str(source_channel_id))
+
+                                        logging.info(f"📅 Moved '{channel.name}' to '{cat.name}'")
+                                        break  # Exit the category loop
+                                    except Exception as e:
+                                        logging.error(f"❌ Could not move '{channel.name}' to Release Guides: {e}")
+                                    break  # Exit the category loop even if error
+
+                    except Exception as e:
+                        logging.error(f"❌ Error processing channel '{channel.name}': {e}")
+                        continue
 
             except Exception as e:
                 logging.error(f"❌ monitor_channels_continuously error: {e}")

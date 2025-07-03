@@ -408,6 +408,7 @@ class MirrorSelfBot(discord.Client):
         if not message.guild:
             return  # Ignore other non-guild messages
 
+        # Skip "posted by" bot messages with attachments (these are usually automated reposts)
         if (
                 message.author.bot
                 and "posted by" in message.content.lower()
@@ -428,7 +429,7 @@ class MirrorSelfBot(discord.Client):
         excluded_categories = get_excluded_categories(server_id)
         excluded_channels = get_excluded_channels(server_id)
 
-        # Replace this block inside on_message
+        # Check excluded categories and channels
         if message.channel.category:
             category_id = message.channel.category.id
             if category_id in excluded_categories:
@@ -444,35 +445,65 @@ class MirrorSelfBot(discord.Client):
         for role in message.role_mentions:
             role_mentions[str(role.id)] = role.name
 
+        # Handle reply information
         reply_to = None
-        if message.reference and isinstance(message.reference.resolved, discord.Message):
-            reply_to = (message.reference.resolved.author.nick or str(message.reference.resolved.author)).replace("#0",
-                                                                                                                  "") \
-                if hasattr(message.reference.resolved.author, "nick") else str(
-                message.reference.resolved.author).replace("#0", "")
-
+        reply_text = None
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             original_msg = message.reference.resolved
             reply_to = original_msg.author.display_name
             reply_text = original_msg.clean_content[:180]  # clip to 180 chars
-        else:
-            reply_to = None
-            reply_text = None
 
+        # CORRECTED FORWARDED MESSAGE DETECTION
+        # Only detect forwards when a user manually forwards a message within Discord
         forwarded_from = None
         forwarded_embeds = []
+        forwarded_attachments = []
 
+        # Method 1: Discord's native message forwarding detection
+        # This happens when someone right-clicks a message and selects "Forward"
         if (
-                not message.embeds
-                and not message.attachments
+                hasattr(message, 'message_reference')
+                and message.message_reference
+                and message.message_reference.guild_id != message.guild.id  # Different guild
                 and message.reference
                 and isinstance(message.reference.resolved, discord.Message)
         ):
             ref_msg = message.reference.resolved
-            if ref_msg and ref_msg.embeds and ref_msg.author.bot:
+            forwarded_from = ref_msg.author.display_name or str(ref_msg.author)
+            forwarded_embeds = [self.format_embed(embed) for embed in ref_msg.embeds]
+            forwarded_attachments = [attachment.url for attachment in ref_msg.attachments]
+            logging.info(f"🔄 Detected cross-guild forwarded message from {forwarded_from}")
+
+        # Method 2: Empty message that quotes another message (manual forwarding)
+        elif (
+                not message.content.strip()  # Empty content
+                and not message.embeds  # No embeds
+                and not message.attachments  # No attachments
+                and message.reference  # References another message
+                and isinstance(message.reference.resolved, discord.Message)
+                and not message.author.bot  # User, not bot
+        ):
+            ref_msg = message.reference.resolved
+            # Only consider it forwarded if the referenced message has content/embeds/attachments
+            if ref_msg and (ref_msg.embeds or ref_msg.attachments or ref_msg.content.strip()):
                 forwarded_from = ref_msg.author.display_name or str(ref_msg.author)
                 forwarded_embeds = [self.format_embed(embed) for embed in ref_msg.embeds]
+                forwarded_attachments = [attachment.url for attachment in ref_msg.attachments]
+                logging.info(f"🔄 Detected manual forwarded message from {forwarded_from}")
 
+        # Method 3: Detect when someone manually types "forwarded from" or similar
+        elif message.content and any(
+                keyword in message.content.lower() for keyword in ["forwarded from", "originally from"]):
+            import re
+            forward_pattern = r"(?:forwarded from|originally from)\s*[@:]?\s*([^\n\r]+)"
+            match = re.search(forward_pattern, message.content, re.IGNORECASE)
+            if match:
+                forwarded_from = match.group(1).strip()
+                logging.info(f"🔄 Detected text-indicated forwarded message from {forwarded_from}")
+
+        # DON'T detect cross-posting or application_id as forwarding - these are different features
+
+        # Prepare message data
         message_data = {
             "reply_to": reply_to,
             "reply_text": reply_text,
@@ -493,11 +524,15 @@ class MirrorSelfBot(discord.Client):
             "attachments": [attachment.url for attachment in message.attachments],
             "forwarded_from": forwarded_from,
             "embeds": (
+                forwarded_embeds if forwarded_embeds else  # Use forwarded embeds if available
                 [self.format_embed(embed) for embed in message.embeds]
                 if message.embeds else
                 [{"image": {"url": message.attachments[0].url}}] if message.attachments else []
             ),
+            "forwarded_attachments": forwarded_attachments,
+            "is_forwarded": bool(forwarded_from),
         }
+
         logging.debug(f"Queued: {message.id} from {server_name}#{message.channel.name}")
 
         try:

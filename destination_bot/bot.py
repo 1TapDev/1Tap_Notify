@@ -2274,13 +2274,28 @@ async def update_slash(interaction: discord.Interaction, description: str):
     version = get_next_version()
     timestamp = datetime.now().strftime("%b %d, %Y | %H:%M:%S")
 
-    # Format the description with proper line breaks, bullets, and indentation
-    # Add bullet to the first item and proper spacing
-    formatted_desc = f"    • {description}".replace(" - ", "\n    • ").replace("Result:", "\n\n**Result:**")
+    # Parse the input to extract title and content
+    parts = description.split(":", 1)
+    if len(parts) == 2:
+        title = parts[0].strip()
+        content = parts[1].strip()
+    else:
+        title = "Update"
+        content = description
+
+    # Format the content with proper bullets and spacing
+    formatted_content = content.replace(" - ", "\n* ").replace("Result:", "\n\n**Result:**")
+
+    # Convert category/channel IDs to clickable links
+    import re
+    formatted_content = re.sub(r'\(ID: (\d+)\)', r'(<#\1>)', formatted_content)
+
+    # Create the final description with proper spacing
+    final_description = f"🔧 **{title}:**\n\n* {formatted_content}"
 
     embed = discord.Embed(
         title="⚠️ New update!",
-        description=f"🔧 **Bot Cleanup Update Improvements:**\n\n{formatted_desc}",
+        description=final_description,
         color=0xFFD700  # Gold color
     )
     embed.set_footer(text=f"Update {version} | 1Tap Notify [{timestamp}]")

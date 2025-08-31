@@ -15,14 +15,24 @@ from datetime import datetime, timezone
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# Setup logging directory
+# Import enhanced logging system
+from modules.logger import (
+    structured_logger, error_aggregator, perf_logger,
+    performance_monitor, async_performance_monitor
+)
+from modules.utilities import (
+    convert_discord_message, retry_with_backoff, get_memory_usage,
+    format_uptime, is_spam_content
+)
+
+# Setup enhanced logging (old basic logging kept as fallback)
 if not os.path.exists("logs"):
     os.makedirs("logs")
 
 # Generate log filename with date and time
 log_filename = datetime.now().strftime("logs/main_%Y-%m-%d_%H-%M-%S.log")
 
-# Configure logging
+# Configure basic logging as fallback
 logging.basicConfig(
     filename=log_filename,
     level=logging.INFO,
@@ -37,9 +47,9 @@ console_formatter = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s
 console_handler.setFormatter(console_formatter)
 logging.getLogger().addHandler(console_handler)
 
-
-def log_message(message):
-    logging.info(message)  # No print
+# Enhanced logging function using structured logger
+def log_message(message, **kwargs):
+    structured_logger.info(message, **kwargs)
 
 
 # Connect to Redis
@@ -93,6 +103,7 @@ class ConfigFileHandler(FileSystemEventHandler):
                 return
             self.last_modified = current_time
             
+            structured_logger.info("Config file changed - reloading configuration")
             print("\n📝 Config file changed - reloading configuration...")
             # Set flag for main loop to handle config reload
             global config_reload_flag
@@ -125,6 +136,11 @@ async def reload_config_dynamically():
                     bot_instance.monitored_servers = {str(server_id) for server_id in new_monitored_servers}
                     print(f"✅ Updated monitoring config for bot {token[:8]}***")
             
+            structured_logger.info(
+                "Configuration reloaded successfully",
+                monitored_servers=len(new_monitored_servers),
+                excluded_categories=len(EXCLUDED_CATEGORIES)
+            )
             print("🔄 Configuration reloaded successfully!")
             print(f"📊 Monitoring {len(new_monitored_servers)} servers")
             print(f"🚫 Excluding {len(EXCLUDED_CATEGORIES)} global categories")
@@ -140,8 +156,17 @@ async def reload_config_dynamically():
                             print(f"🔒 {server_name}: {len(excluded_channels)} excluded channels, {len(excluded_categories)} excluded categories")
             
     except Exception as e:
+        error_aggregator.record_error(
+            "ConfigReloadError",
+            str(e),
+            {"function": "reload_config_dynamically"}
+        )
+        structured_logger.error(
+            "Failed to reload config",
+            error_type=type(e).__name__,
+            error_message=str(e)
+        )
         print(f"❌ Failed to reload config: {e}")
-        logging.error(f"Config reload error: {e}")
 
 def start_config_watcher():
     """Start watching config.json for changes."""
@@ -222,7 +247,11 @@ def save_user_info(token, user_info):
             "last_successful_login": datetime.now(timezone.utc).isoformat()
         }
         save_config(config)
-        logging.info(f"✅ Saved user info for {user_info} to config")
+        structured_logger.info(
+            "Saved user info to config",
+            user_id=str(user_info.id),
+            username=str(user_info)
+        )
 
 
 def mark_token_as_failed(token, error_message):
@@ -354,12 +383,22 @@ def should_allow_dm(message):
 
     # Block spam messages
     if is_spam_dm(message):
-        logging.info(f"🚫 Blocked spam DM from {message.author}: {message.content[:50]}...")
+        structured_logger.warning(
+            "Blocked spam DM",
+            author_id=message.author.id,
+            author_name=str(message.author),
+            content_preview=message.content[:50]
+        )
         return False
 
     # Block friend request DMs (no mutual servers)
     if is_friend_request_dm(message):
-        logging.info(f"🚫 Blocked friend request DM from {message.author}: {message.content[:50]}...")
+        structured_logger.warning(
+            "Blocked friend request DM",
+            author_id=message.author.id,
+            author_name=str(message.author),
+            content_preview=message.content[:50]
+        )
         return False
 
     return True
@@ -414,6 +453,13 @@ class MirrorSelfBot(discord.Client):
 
     async def on_ready(self):
         await self.fetch_guilds()
+        
+        structured_logger.info(
+            "Self-bot ready",
+            user_id=str(self.user.id),
+            username=str(self.user),
+            guild_count=len(self.guilds)
+        )
         print(f"✅ Self-bot {self.user} is running!")
 
         # Save user info on successful login
@@ -510,6 +556,7 @@ class MirrorSelfBot(discord.Client):
 
             await asyncio.sleep(10)  # Recheck every 10 seconds
 
+    @async_performance_monitor
     async def on_message(self, message):
         await asyncio.sleep(0.5)  # Small delay to let Discord register attachments
 
@@ -555,7 +602,15 @@ class MirrorSelfBot(discord.Client):
         if message.channel.id in excluded_channels:
             return
 
-        logging.info(f"✅ ACCEPTED: Message from {server_name} (ID: {server_id}) in #{message.channel.name}")
+        structured_logger.info(
+            "Message accepted for processing",
+            server_name=server_name,
+            server_id=server_id,
+            channel_name=message.channel.name,
+            channel_id=message.channel.id,
+            author_id=message.author.id,
+            message_id=message.id
+        )
 
         # Map all roles mentioned in the message (id → name)
         role_mentions = {}
@@ -654,9 +709,31 @@ class MirrorSelfBot(discord.Client):
 
         try:
             redis_client.lpush("message_queue", json.dumps(message_data))
-            logging.info(f"✅ QUEUED to Redis: message_id={message.id}")
-            log_message(f"📩 Pushed message from {message.author} in #{message.channel.name} to Redis.")
+            structured_logger.info(
+                "Message queued to Redis",
+                message_id=message.id,
+                author_id=message.author.id,
+                channel_name=message.channel.name,
+                server_name=server_name
+            )
+            log_message(
+                "Pushed message to Redis", 
+                author=str(message.author),
+                channel=message.channel.name,
+                server=server_name
+            )
         except Exception as e:
+            error_aggregator.record_error(
+                "RedisQueueError",
+                str(e),
+                {"message_id": message.id, "server_id": server_id}
+            )
+            structured_logger.error(
+                "Failed to push message to Redis",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                message_id=message.id
+            )
             print(f"❌ ERROR: Failed to push message to Redis: {e}")
 
         # ✅ Send to bot.py
@@ -738,7 +815,11 @@ class MirrorSelfBot(discord.Client):
         try:
             redis_client.lpush("message_queue", json.dumps(message_data))
             logging.info(f"✅ QUEUED DM to Redis: message_id={message.id} from {author_display_name}")
-            log_message(f"📨 Pushed DM from {author_display_name} to Redis.")
+            log_message(
+                "Pushed DM to Redis", 
+                author=author_display_name,
+                message_type="dm"
+            )
         except Exception as e:
             logging.error(f"❌ ERROR: Failed to push DM to Redis: {e}")
 

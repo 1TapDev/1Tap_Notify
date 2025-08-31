@@ -63,6 +63,80 @@ def save_config(config_data):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config_data, f, indent=4)
 
+def capture_server_layout(guild):
+    """Capture the current server layout with all categories and channel positions."""
+    layout = {
+        "captured_at": datetime.now().isoformat(),
+        "server_id": guild.id,
+        "server_name": guild.name,
+        "categories": {},
+        "uncategorized_channels": []
+    }
+    
+    # Capture categorized channels
+    for category in guild.categories:
+        layout["categories"][category.id] = {
+            "name": category.name,
+            "position": category.position,
+            "channels": []
+        }
+        
+        for channel in category.channels:
+            if isinstance(channel, discord.TextChannel):
+                layout["categories"][category.id]["channels"].append({
+                    "id": channel.id,
+                    "name": channel.name,
+                    "position": channel.position
+                })
+    
+    # Capture uncategorized channels
+    uncategorized = [ch for ch in guild.text_channels if ch.category is None]
+    for channel in uncategorized:
+        layout["uncategorized_channels"].append({
+            "id": channel.id,
+            "name": channel.name,
+            "position": channel.position
+        })
+    
+    return layout
+
+def save_server_layout(guild):
+    """Save the current server layout to a file."""
+    layout = capture_server_layout(guild)
+    layout_file = f"server_layout_{guild.id}.json"
+    
+    with open(layout_file, "w", encoding="utf-8") as f:
+        json.dump(layout, f, indent=4)
+    
+    logging.info(f"🔒 Server layout saved to {layout_file}")
+    logging.info(f"📋 Captured {len(layout['categories'])} categories and {len(layout['uncategorized_channels'])} uncategorized channels")
+    return layout_file
+
+def load_server_layout(guild_id):
+    """Load the saved server layout from file."""
+    layout_file = f"server_layout_{guild_id}.json"
+    
+    try:
+        with open(layout_file, "r", encoding="utf-8") as f:
+            layout = json.load(f)
+        logging.info(f"🔓 Loaded server layout from {layout_file}")
+        return layout
+    except FileNotFoundError:
+        logging.warning(f"⚠️ No saved layout found: {layout_file}")
+        return None
+    except Exception as e:
+        logging.error(f"❌ Failed to load layout: {e}")
+        return None
+
+# Category IDs for moveable categories
+RELEASE_GUIDES_CATEGORY_ID = 1348464705701806080
+DAILY_SCHEDULE_CATEGORY_ID = 1353704482457915433
+MOVEABLE_CATEGORY_IDS = {RELEASE_GUIDES_CATEGORY_ID, DAILY_SCHEDULE_CATEGORY_ID}
+
+def is_moveable_category(category_id):
+    """Check if channels in this category are allowed to be moved."""
+    return category_id in MOVEABLE_CATEGORY_IDS
+
 config = load_config()
 
 BOT_TOKEN = config.get("bot_token")
@@ -1480,7 +1554,7 @@ class DestinationBot(commands.Bot):
                         continue
 
                     # Daily Schedule - 24 hour expiration
-                    if category.name.startswith("📅 Daily Schedule"):
+                    if category.id == DAILY_SCHEDULE_CATEGORY_ID:
                         for channel in category.channels:
                             if not isinstance(channel, discord.TextChannel):
                                 continue
@@ -1490,36 +1564,40 @@ class DestinationBot(commands.Bot):
                             stored_time = redis_client.get(creation_key)
 
                             if not stored_time:
-                                # First time seeing this channel, store its creation time
-                                redis_client.setex(creation_key, 86400 * 2,
-                                                   current_time.isoformat())  # Store for 48 hours
-                                logging.info(f"📅 Tracking new daily channel: {channel.name}")
+                                # First time seeing this channel, store Discord's creation time
+                                discord_creation_time = channel.created_at
+                                redis_client.setex(creation_key, 86400 * 3,  # Store for 72 hours
+                                                   discord_creation_time.isoformat())
+                                logging.info(f"📅 Tracking new daily channel: {channel.name} (created: {discord_creation_time})")
+                                created_time = discord_creation_time
                             else:
-                                # Check if 24 hours have passed
+                                # Load stored creation time
                                 created_time = datetime.fromisoformat(stored_time)
-                                time_elapsed = current_time - created_time
+                            
+                            # Check if 24 hours have passed since Discord creation
+                            time_elapsed = current_time - created_time.replace(tzinfo=None)
 
-                                if time_elapsed >= timedelta(hours=24):
-                                    # Check if channel is protected
-                                    config_data = load_config()
-                                    protected_channels = config_data.get("protected_channels", [])
+                            if time_elapsed >= timedelta(hours=24):
+                                # Check if channel is protected
+                                config_data = load_config()
+                                protected_channels = config_data.get("protected_channels", [])
 
-                                    if channel.id in protected_channels:
-                                        logging.info(f"🛡️ Skipping deletion of protected daily channel: {channel.name}")
-                                        continue
+                                if channel.id in protected_channels:
+                                    logging.info(f"🛡️ Skipping deletion of protected daily channel: {channel.name}")
+                                    continue
 
-                                    try:
-                                        await channel.delete(reason="Daily Schedule channel expired (24 hours)")
-                                        redis_client.delete(creation_key)
-                                        logging.info(
-                                            f"🗑️ Deleted expired daily channel: {channel.name} (age: {time_elapsed})")
-                                    except Exception as e:
-                                        # Silently handle 404 errors for expired channels
-                                        if "404" not in str(e) and "Unknown Channel" not in str(e):
-                                            logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
+                                try:
+                                    await channel.delete(reason="Daily Schedule channel expired (24 hours)")
+                                    redis_client.delete(creation_key)
+                                    logging.info(
+                                        f"🗑️ Deleted expired daily channel: {channel.name} (age: {time_elapsed})")
+                                except Exception as e:
+                                    # Silently handle 404 errors for expired channels
+                                    if "404" not in str(e) and "Unknown Channel" not in str(e):
+                                        logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
 
                     # Release Guides - 7 days expiration or past date
-                    elif category.name.startswith("📅 Release Guides"):
+                    elif category.id == RELEASE_GUIDES_CATEGORY_ID:
                         for channel in category.channels:
                             if not isinstance(channel, discord.TextChannel):
                                 continue
@@ -1558,32 +1636,36 @@ class DestinationBot(commands.Bot):
                             stored_time = redis_client.get(creation_key)
 
                             if not stored_time:
-                                # First time seeing this channel, store its creation time
-                                redis_client.setex(creation_key, 86400 * 14,
-                                                   current_time.isoformat())  # Store for 14 days
-                                logging.info(f"📅 Tracking new release channel: {channel.name}")
+                                # First time seeing this channel, store Discord's creation time
+                                discord_creation_time = channel.created_at
+                                redis_client.setex(creation_key, 86400 * 15,  # Store for 15 days
+                                                   discord_creation_time.isoformat())
+                                logging.info(f"📅 Tracking new release channel: {channel.name} (created: {discord_creation_time})")
+                                created_time = discord_creation_time
                             else:
-                                # Check if 7 days have passed
+                                # Load stored creation time
                                 created_time = datetime.fromisoformat(stored_time)
-                                time_elapsed = current_time - created_time
+                            
+                            # Check if 7 days have passed since Discord creation
+                            time_elapsed = current_time - created_time.replace(tzinfo=None)
 
-                                if time_elapsed >= timedelta(days=7):
-                                    # Check if channel is protected
-                                    config_data = load_config()
-                                    protected_channels = config_data.get("protected_channels", [])
+                            if time_elapsed >= timedelta(days=7):
+                                # Check if channel is protected
+                                config_data = load_config()
+                                protected_channels = config_data.get("protected_channels", [])
 
-                                    if channel.id in protected_channels:
-                                        logging.info(
-                                            f"🛡️ Skipping deletion of protected release channel: {channel.name}")
-                                        continue
+                                if channel.id in protected_channels:
+                                    logging.info(
+                                        f"🛡️ Skipping deletion of protected release channel: {channel.name}")
+                                    continue
 
-                                    try:
-                                        await channel.delete(reason="Release Guide channel expired (7 days)")
-                                        redis_client.delete(creation_key)
-                                        logging.info(
-                                            f"🗑️ Deleted expired release channel: {channel.name} (age: {time_elapsed})")
-                                    except Exception as e:
-                                        logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
+                                try:
+                                    await channel.delete(reason="Release Guide channel expired (7 days)")
+                                    redis_client.delete(creation_key)
+                                    logging.info(
+                                        f"🗑️ Deleted expired release channel: {channel.name} (age: {time_elapsed})")
+                                except Exception as e:
+                                    logging.error(f"❌ Failed to delete expired channel {channel.name}: {e}")
 
             except Exception as e:
                 logging.error(f"❌ cleanup_expired_channels error: {e}")
@@ -1602,15 +1684,15 @@ class DestinationBot(commands.Bot):
 
         while not self.is_closed():
             try:
-                # Sort channels ONLY in the specific target categories
+                # Sort channels in all eligible categories
                 for category in guild.categories:
                     if "[DM]" in category.name:
                         continue
 
-                    # ONLY sort channels in these exact categories
-                    if category.name == "📅 Release Guides [1Tap Notify]":
+                    # Sort channels in Release Guides and Daily Schedule categories using IDs
+                    if category.id == RELEASE_GUIDES_CATEGORY_ID:
                         await self.sort_channels_in_category(category, by="date")
-                    elif category.name == "📅 Daily Schedule [1Tap Notify]":
+                    elif category.id == DAILY_SCHEDULE_CATEGORY_ID:
                         await self.sort_channels_in_category(category, by="time")
                     # Skip all other categories completely
                     else:
@@ -1754,8 +1836,9 @@ class DestinationBot(commands.Bot):
             await asyncio.sleep(10)
 
     async def sort_channels_in_category(self, category, by="date"):
-        if category.name not in ["📅 Daily Schedule [1Tap Notify]", "📅 Release Guides [1Tap Notify]"]:
-            logging.info(f"⛔ Skipping category '{category.name}' — not eligible for sorting.")
+        # Only allow sorting in moveable categories (Release Guides or Daily Schedule)
+        if not is_moveable_category(category.id):
+            logging.info(f"🔒 Layout Protection: Skipping category '{category.name}' (ID: {category.id}) - not a moveable category")
             return
         logging.info(f"🔃 Sorting '{category.name}' by {by} with {len(category.channels)} channels")
 
@@ -1763,37 +1846,6 @@ class DestinationBot(commands.Bot):
             # Remove emojis and special characters for parsing
             clean_name = re.sub(r'[^\w\s:-]', '', name.lower())
             logging.info(f"🔎 Evaluating sort key for: {name} → cleaned: {clean_name}")
-
-            # Check if channel has ONLY a color emoji (no date/time)
-            has_only_color_emoji = False
-            color_emoji_patterns = ["🔴", "🟡", "🟢", "red", "yellow", "green"]
-
-            # Check if it starts with just a color emoji and has no date/time pattern
-            if any(name.strip().startswith(emoji) for emoji in ["🔴", "🟡", "🟢"]):
-                has_date_time = bool(re.search(r'\b\d{1,2}[-/]\d{1,2}\b', clean_name)) or bool(
-                    re.search(r'\b\d{1,2}(am|pm)\b', clean_name))
-                if not has_date_time:
-                    has_only_color_emoji = True
-                    logging.info(f"🎯 Channel '{name}' has only color emoji - will be moved to bottom")
-
-            # Extract color priority
-            color_priority = 999  # Default if no color found
-            if "🔴" in name or "red" in name.lower():
-                color_priority = 0  # Red first
-            elif "🟡" in name or "yellow" in name.lower():
-                color_priority = 1  # Yellow second
-            elif "🟢" in name or "green" in name.lower():
-                color_priority = 2  # Green third
-            else:
-                # Any other emoji (📱, ⚠️, etc.) goes to top
-                other_emojis = re.findall(r'[^\w\s\-:]', name)
-                if other_emojis:
-                    color_priority = -1  # Other emojis go to top
-                    logging.info(f"🔝 Channel '{name}' has other emoji, moving to top")
-
-            # If channel has only color emoji, put it at the very bottom
-            if has_only_color_emoji:
-                return (999999, color_priority)  # Bottom of the list
 
             if by == "date":
                 # Match patterns like 4-17, 04-17, 4/17
@@ -1804,9 +1856,8 @@ class DestinationBot(commands.Bot):
                         month = int(match.group(1))
                         day = int(match.group(2))
                         date_val = datetime(2025, month, day)  # Use current year
-                        logging.info(
-                            f"✅ Parsed date for '{name}': {date_val.strftime('%m-%d')}, color_priority: {color_priority}")
-                        return (date_val.timestamp(), color_priority)
+                        logging.info(f"✅ Parsed date for '{name}': {date_val.strftime('%m-%d')}")
+                        return date_val.timestamp()
                     except Exception as e:
                         logging.warning(f"⚠️ Failed to parse date for '{name}': {e}")
 
@@ -1818,17 +1869,14 @@ class DestinationBot(commands.Bot):
                         time_val = datetime.strptime(match.group(0), "%I%p")
                         # Convert to 24-hour format for proper sorting
                         hour_24 = time_val.hour
-                        logging.info(f"✅ Parsed time for '{name}': {hour_24:02d}:00, color_priority: {color_priority}")
-                        return (hour_24, color_priority)
+                        logging.info(f"✅ Parsed time for '{name}': {hour_24:02d}:00")
+                        return hour_24
                     except Exception as e:
                         logging.warning(f"⚠️ Failed to parse time for '{name}': {e}")
 
-            # No valid date/time found
+            # No valid date/time found - channels without date/time go to end
             logging.info(f"🔽 No valid sort key found for: {name}")
-            if color_priority == -1:  # Other emojis
-                return (-1, 0)  # Top of the list
-            else:
-                return (999998, color_priority)  # Bottom but above color-only channels
+            return 999999  # Bottom of the list
 
         try:
             # Get all text channels in this category
@@ -1840,6 +1888,14 @@ class DestinationBot(commands.Bot):
 
             # Sort channels by the extracted key
             sorted_channels = sorted(channels_to_sort, key=lambda ch: extract_sort_key(ch.name))
+            
+            # Check if channels are already in the correct order
+            current_order = [ch.name for ch in channels_to_sort]
+            target_order = [ch.name for ch in sorted_channels]
+            
+            if current_order == target_order:
+                logging.info(f"✅ Channels in '{category.name}' are already sorted correctly")
+                return
 
             # Reorder channels by editing positions
             logging.info(f"🔄 Reordering channels in '{category.name}'...")
@@ -1865,9 +1921,10 @@ class DestinationBot(commands.Bot):
 
         while not self.is_closed():
             try:
-                # Find the Release Guides category
-                release_guides_category = discord.utils.get(guild.categories, name="📅 Release Guides [1Tap Notify]")
+                # Find the Release Guides category by ID
+                release_guides_category = discord.utils.get(guild.categories, id=RELEASE_GUIDES_CATEGORY_ID)
                 if not release_guides_category:
+                    logging.warning(f"⚠️ Release Guides category not found (ID: {RELEASE_GUIDES_CATEGORY_ID})")
                     await asyncio.sleep(60)
                     continue
 
@@ -2122,7 +2179,8 @@ async def help_slash(interaction: discord.Interaction):
         ("/listblocked", "List all blocked channels"),
         ("/dmstats", "Show DM mirroring statistics"),
         ("/dmfilters", "Show DM filtering status"),
-        ("/update", "Post an update to the updates channel (Admin only)")
+        ("/update", "Post an update to the updates channel (Admin only)"),
+        ("/capture_layout", "Capture and lock the current server layout")
     ]
 
     for cmd, desc in commands_info:
@@ -2571,6 +2629,69 @@ async def list_protected_channels(interaction: discord.Interaction):
 
     except Exception as e:
         await interaction.response.send_message(f"❌ Error listing protected channels: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="capture_layout", description="Capture and save the current server layout to lock it in place")
+@app_commands.describe()
+async def capture_layout_slash(interaction: discord.Interaction):
+    """Capture and save the current server layout for protection."""
+    try:
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ This command must be used in a server!", ephemeral=True)
+            return
+        
+        # Capture and save layout
+        layout_file = save_server_layout(guild)
+        
+        # Count categories and channels
+        total_categories = len(guild.categories)
+        total_channels = len(guild.text_channels)
+        
+        moveable_categories = 0
+        moveable_channels = 0
+        
+        for category in guild.categories:
+            if is_moveable_category(category.id):
+                moveable_categories += 1
+                moveable_channels += len([ch for ch in category.channels if isinstance(ch, discord.TextChannel)])
+        
+        uncategorized = len([ch for ch in guild.text_channels if ch.category is None])
+        
+        embed = discord.Embed(
+            title="🔒 Server Layout Captured & Locked",
+            description=f"Server layout has been saved to `{layout_file}`",
+            color=0x00FF00
+        )
+        
+        embed.add_field(
+            name="📊 Total Categories", 
+            value=f"{total_categories} categories\n{total_channels} text channels", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🔓 Protected (Locked)", 
+            value=f"{total_categories - moveable_categories} categories\n{total_channels - moveable_channels - uncategorized} channels", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🔄 Moveable", 
+            value=f"{moveable_categories} categories\n{moveable_channels} channels\n{uncategorized} uncategorized", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="ℹ️ Info",
+            value="Only channels in **Release Guides** and **Daily Schedule** categories can be moved.\nAll other categories are now layout-protected.",
+            inline=False
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to capture layout: {e}")
+        await interaction.response.send_message(f"❌ Error capturing layout: {str(e)}", ephemeral=True)
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

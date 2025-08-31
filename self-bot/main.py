@@ -9,8 +9,11 @@ import hashlib
 import traceback
 import signal
 import re
+import threading
 from dotenv import load_dotenv
 from datetime import datetime, timezone
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # Setup logging directory
 if not os.path.exists("logs"):
@@ -68,6 +71,82 @@ WEBHOOKS = config.get("webhooks", {})
 MESSAGE_DELAY = config["settings"].get("message_delay", 0.75)  # Default to 0.75s delay
 DESTINATION_BOT_URL = "http://127.0.0.1:5000/process_message"  # Change if bot.py is remote
 MAX_LOGIN_ATTEMPTS = config["settings"].get("max_login_attempts", 3)  # Add this setting
+
+# Global variables to track active bots for dynamic reloading
+active_bots = {}  # Dictionary to store active bot instances
+config_lock = threading.Lock()  # Thread lock for config updates
+config_reload_flag = False  # Flag to signal config reload needed
+
+class ConfigFileHandler(FileSystemEventHandler):
+    """Handle config.json file changes and reload configuration dynamically."""
+    
+    def __init__(self):
+        super().__init__()
+        self.last_modified = 0
+    
+    def on_modified(self, event):
+        if not event.is_directory and event.src_path.endswith('config.json'):
+            # Debounce file changes (avoid multiple triggers)
+            current_time = datetime.now().timestamp()
+            if current_time - self.last_modified < 1:  # 1 second debounce
+                return
+            self.last_modified = current_time
+            
+            print("\n📝 Config file changed - reloading configuration...")
+            # Set flag for main loop to handle config reload
+            global config_reload_flag
+            config_reload_flag = True
+
+async def reload_config_dynamically():
+    """Reload config and update active bots with new exclusions."""
+    global TOKENS, EXCLUDED_CATEGORIES, MESSAGE_DELAY, MAX_LOGIN_ATTEMPTS
+    
+    try:
+        with config_lock:
+            # Reload config from file
+            new_config = load_config()
+            
+            # Update global variables
+            TOKENS = new_config["tokens"]
+            EXCLUDED_CATEGORIES = set(new_config.get("excluded_categories", []))
+            MESSAGE_DELAY = new_config["settings"].get("message_delay", 0.75)
+            MAX_LOGIN_ATTEMPTS = new_config["settings"].get("max_login_attempts", 3)
+            
+            # Update monitored servers for all active bots
+            new_monitored_servers = get_monitored_server_ids()
+            
+            for token, bot_instance in active_bots.items():
+                if hasattr(bot_instance, 'monitored_servers'):
+                    # Update the bot's monitored servers
+                    bot_instance.monitored_servers = {str(server_id) for server_id in new_monitored_servers}
+                    print(f"✅ Updated monitoring config for bot {token[:8]}***")
+            
+            print("🔄 Configuration reloaded successfully!")
+            print(f"📊 Monitoring {len(new_monitored_servers)} servers")
+            print(f"🚫 Excluding {len(EXCLUDED_CATEGORIES)} global categories")
+            
+            # Log excluded channels per server
+            for token_data in TOKENS.values():
+                if "servers" in token_data:
+                    for server_id, server_config in token_data["servers"].items():
+                        excluded_channels = server_config.get("excluded_channels", [])
+                        excluded_categories = server_config.get("excluded_categories", [])
+                        if excluded_channels or excluded_categories:
+                            server_name = get_server_info(server_id)
+                            print(f"🔒 {server_name}: {len(excluded_channels)} excluded channels, {len(excluded_categories)} excluded categories")
+            
+    except Exception as e:
+        print(f"❌ Failed to reload config: {e}")
+        logging.error(f"Config reload error: {e}")
+
+def start_config_watcher():
+    """Start watching config.json for changes."""
+    event_handler = ConfigFileHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path='.', recursive=False)
+    observer.start()
+    print("👀 Started watching config.json for changes...")
+    return observer
 
 # Track failed tokens
 failed_tokens = set()
@@ -910,7 +989,10 @@ async def process_dm_relay_queue():
 
 # Start listening for requests
 async def main():
-    global bot_instances
+    global bot_instances, active_bots
+
+    # Start config file watcher
+    config_observer = start_config_watcher()
 
     # First, add the max_login_attempts setting if it doesn't exist
     if "max_login_attempts" not in config.get("settings", {}):
@@ -951,6 +1033,7 @@ async def main():
 
         bot = MirrorSelfBot(token, server_ids)
         bot_instances[token] = bot  # Store for DM relay functionality
+        active_bots[token] = bot  # Store for config reloading
 
         async def try_start_bot(bot_instance, token):
             delay = 5
@@ -1010,9 +1093,17 @@ async def main():
 
     try:
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(5)  # Check every 5 seconds
+            
+            # Check if config reload is needed
+            global config_reload_flag
+            if config_reload_flag:
+                config_reload_flag = False  # Reset flag
+                await reload_config_dynamically()
     finally:
         print("👋 Shutting down...")
+        config_observer.stop()
+        config_observer.join()
         for bot in bot_instances.values():
             await bot.close()
 

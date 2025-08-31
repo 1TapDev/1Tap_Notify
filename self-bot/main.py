@@ -76,6 +76,7 @@ MAX_LOGIN_ATTEMPTS = config["settings"].get("max_login_attempts", 3)  # Add this
 active_bots = {}  # Dictionary to store active bot instances
 config_lock = threading.Lock()  # Thread lock for config updates
 config_reload_flag = False  # Flag to signal config reload needed
+server_name_cache = {}  # Cache for server names to avoid repeated API calls
 
 class ConfigFileHandler(FileSystemEventHandler):
     """Handle config.json file changes and reload configuration dynamically."""
@@ -99,10 +100,13 @@ class ConfigFileHandler(FileSystemEventHandler):
 
 async def reload_config_dynamically():
     """Reload config and update active bots with new exclusions."""
-    global TOKENS, EXCLUDED_CATEGORIES, MESSAGE_DELAY, MAX_LOGIN_ATTEMPTS
+    global TOKENS, EXCLUDED_CATEGORIES, MESSAGE_DELAY, MAX_LOGIN_ATTEMPTS, server_name_cache
     
     try:
         with config_lock:
+            # Clear server name cache to refresh names
+            server_name_cache.clear()
+            
             # Reload config from file
             new_config = load_config()
             
@@ -169,8 +173,42 @@ def get_excluded_channels(server_id):
 
 
 def get_server_info(server_id):
-    """Retrieve human-readable server name from config.json."""
-    return DESTINATION_SERVERS.get(str(server_id), {}).get("info", f"Unknown Server ({server_id})")
+    """Retrieve human-readable server name from active bot instances or config.json."""
+    server_id_str = str(server_id)
+    
+    # Check cache first
+    if server_id_str in server_name_cache:
+        return server_name_cache[server_id_str]
+    
+    server_name = None
+    
+    # First, try to get server name from active bot instances
+    try:
+        for bot_instance in active_bots.values():
+            if hasattr(bot_instance, 'guilds') and bot_instance.guilds:
+                for guild in bot_instance.guilds:
+                    if str(guild.id) == server_id_str:
+                        server_name = guild.name
+                        break
+            if server_name:
+                break
+    except Exception as e:
+        # Silently handle any errors accessing bot instances
+        pass
+    
+    # Fallback to config.json destination servers info
+    if not server_name:
+        server_info = DESTINATION_SERVERS.get(server_id_str, {}).get("info")
+        if server_info:
+            server_name = server_info
+    
+    # Final fallback
+    if not server_name:
+        server_name = f"Unknown Server ({server_id})"
+    
+    # Cache the result for future use
+    server_name_cache[server_id_str] = server_name
+    return server_name
 
 
 def save_user_info(token, user_info):

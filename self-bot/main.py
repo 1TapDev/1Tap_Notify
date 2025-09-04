@@ -698,8 +698,6 @@ class MirrorSelfBot(discord.Client):
             "embeds": (
                 forwarded_embeds if forwarded_embeds else  # Use forwarded embeds if available
                 [self.format_embed(embed) for embed in message.embeds]
-                if message.embeds else
-                [{"image": {"url": message.attachments[0].url}}] if message.attachments else []
             ),
             "forwarded_attachments": forwarded_attachments,
             "is_forwarded": bool(forwarded_from),
@@ -796,11 +794,7 @@ class MirrorSelfBot(discord.Client):
             "timestamp": str(message.created_at),
             "attachments": [attachment.url for attachment in message.attachments],
             "forwarded_from": None,
-            "embeds": (
-                [self.format_embed(embed) for embed in message.embeds]
-                if message.embeds else
-                [{"image": {"url": message.attachments[0].url}}] if message.attachments else []
-            ),
+            "embeds": [self.format_embed(embed) for embed in message.embeds],
             "destination_server_id": destination_server_id,
             "dm_user_id": str(message.author.id),
             "dm_username": author_display_name,

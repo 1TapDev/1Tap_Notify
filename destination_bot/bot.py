@@ -1376,10 +1376,10 @@ class DestinationBot(commands.Bot):
         print("✅ Webhook setup complete. Bot is now processing messages.")
         asyncio.create_task(process_redis_messages())
         asyncio.create_task(monitor_dm_channels())
-        asyncio.create_task(self.monitor_channels_continuously())
+        # RESTRICTED: Only organize channels in Release Guides and Daily Schedule categories
+        asyncio.create_task(self.monitor_allowed_categories_only())
         asyncio.create_task(self.monitor_deleted_channels())
         asyncio.create_task(self.cleanup_expired_channels())
-        asyncio.create_task(self.move_color_only_channels_to_release_guides())
 
     async def on_disconnect(self):
         """Handle disconnect events"""
@@ -1673,7 +1673,62 @@ class DestinationBot(commands.Bot):
             # Check every 30 minutes
             await asyncio.sleep(1800)
 
-    async def monitor_channels_continuously(self):
+    async def monitor_allowed_categories_only(self):
+        """RESTRICTED: Only organize channels in Release Guides and Daily Schedule categories"""
+        await self.wait_until_ready()
+        guild = self.get_guild(DESTINATION_SERVER_ID)
+        
+        # ALLOWED categories for channel moving
+        ALLOWED_CATEGORY_IDS = {1348464705701806080, 1353704482457915433}  # Release Guides, Daily Schedule
+        
+        while not self.is_closed():
+            try:
+                # Only process channels in allowed categories
+                for category in guild.categories:
+                    if category.id not in ALLOWED_CATEGORY_IDS:
+                        continue  # Skip all other categories - respect server_layout
+                        
+                    # Only organize channels within these 2 allowed categories
+                    for channel in category.channels:
+                        if not isinstance(channel, discord.TextChannel):
+                            continue
+                            
+                        # Apply the existing logic only to allowed categories
+                        await self._process_channel_in_allowed_category(channel, category)
+                        
+            except Exception as e:
+                logging.error(f"❌ monitor_allowed_categories_only error: {e}")
+                
+            await asyncio.sleep(30)  # Check every 30 seconds
+    
+    async def _process_channel_in_allowed_category(self, channel, category):
+        """Process a single channel within an allowed category"""
+        try:
+            # Only move channels with date patterns in Release Guides
+            if category.id == 1348464705701806080:  # Release Guides
+                # Check for date patterns in channel name
+                import re
+                has_date_pattern = bool(
+                    re.search(r'\b(\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b', channel.name) or
+                    re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', channel.name.lower()) or
+                    re.search(r'\b\d{1,2}(st|nd|rd|th)\b', channel.name.lower())
+                )
+                
+                # Color-only channels (no date/time) get moved to Release Guides if not already there
+                if not has_date_pattern and channel.category.id != 1348464705701806080:
+                    release_guides = discord.utils.get(guild.categories, id=1348464705701806080)
+                    if release_guides:
+                        await channel.edit(category=release_guides)
+                        logging.info(f"📅 Moved '{channel.name}' to Release Guides")
+                        
+            elif category.id == 1353704482457915433:  # Daily Schedule  
+                # Apply Daily Schedule specific logic here if needed
+                pass
+                
+        except Exception as e:
+            logging.error(f"❌ Error processing channel '{channel.name}' in allowed category: {e}")
+
+    async def monitor_channels_continuously_DISABLED(self):
         await self.wait_until_ready()
         guild = self.get_guild(DESTINATION_SERVER_ID)
 
@@ -1914,7 +1969,7 @@ class DestinationBot(commands.Bot):
             logging.error(f"❌ Error sorting category '{category.name}': {e}")
 
 
-    async def move_color_only_channels_to_release_guides(self):
+    async def move_color_only_channels_to_release_guides_DISABLED(self):
         """Move channels with only color emojis to Release Guides category"""
         await self.wait_until_ready()
         guild = self.get_guild(DESTINATION_SERVER_ID)
@@ -2630,6 +2685,90 @@ async def list_protected_channels(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"❌ Error listing protected channels: {str(e)}", ephemeral=True)
 
+@bot.tree.command(name="organize_channels", description="Manually organize channels in Release Guides and Daily Schedule categories")
+@app_commands.describe()
+async def organize_channels_slash(interaction: discord.Interaction):
+    """Manually organize channels in allowed categories only."""
+    try:
+        # Check permissions
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ You need administrator permissions to use this command.",
+                                                   ephemeral=True)
+            return
+            
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ This command must be used in a server!", ephemeral=True)
+            return
+            
+        await interaction.response.defer(ephemeral=True)
+        
+        # Only organize channels in allowed categories
+        ALLOWED_CATEGORY_IDS = {1348464705701806080, 1353704482457915433}  # Release Guides, Daily Schedule
+        organized_count = 0
+        
+        for category in guild.categories:
+            if category.id not in ALLOWED_CATEGORY_IDS:
+                continue  # Skip protected categories
+                
+            logging.info(f"🔄 Organizing channels in category: {category.name}")
+            
+            for channel in category.channels:
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                    
+                try:
+                    # Apply organization logic to this channel
+                    if category.id == 1348464705701806080:  # Release Guides
+                        # Only move channels that need to be moved (color-only channels without dates)
+                        import re
+                        has_date_pattern = bool(
+                            re.search(r'\\b(\\d{1,2}[-/]\\d{1,2}|\\d{1,2}[-/]\\d{1,2}[-/]\\d{2,4})\\b', channel.name) or
+                            re.search(r'\\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\b', channel.name.lower()) or
+                            re.search(r'\\b\\d{1,2}(st|nd|rd|th)\\b', channel.name.lower())
+                        )
+                        
+                        # If channel has no date pattern and is not already in Release Guides, move it
+                        if not has_date_pattern and channel.category.id != 1348464705701806080:
+                            release_guides = discord.utils.get(guild.categories, id=1348464705701806080)
+                            if release_guides:
+                                await channel.edit(category=release_guides)
+                                logging.info(f"📅 Moved '{channel.name}' to Release Guides")
+                                organized_count += 1
+                                
+                    elif category.id == 1353704482457915433:  # Daily Schedule
+                        # Apply Daily Schedule specific organization if needed
+                        organized_count += 1
+                        
+                except Exception as e:
+                    logging.error(f"❌ Failed to organize channel '{channel.name}': {e}")
+                    
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
+        
+        embed = discord.Embed(
+            title="🔄 Channel Organization Complete",
+            description=f"Organized {organized_count} channels in allowed categories.",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="✅ Allowed Categories", 
+            value="• 📅 Release Guides [1Tap Notify]\n• 📅 Daily Schedule [1Tap Notify]", 
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔒 Protected Categories",
+            value="All other categories follow server_layout.json and are protected from automatic moving.",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error organizing channels: {str(e)}", ephemeral=True)
+
 @bot.tree.command(name="capture_layout", description="Capture and save the current server layout to lock it in place")
 @app_commands.describe()
 async def capture_layout_slash(interaction: discord.Interaction):
@@ -2669,21 +2808,34 @@ async def capture_layout_slash(interaction: discord.Interaction):
             inline=True
         )
         
+        # Calculate protected vs moveable
+        allowed_category_ids = {1348464705701806080, 1353704482457915433}  # Release Guides, Daily Schedule
+        allowed_categories = 0
+        allowed_channels = 0
+        
+        for category in guild.categories:
+            if category.id in allowed_category_ids:
+                allowed_categories += 1
+                allowed_channels += len([ch for ch in category.channels if isinstance(ch, discord.TextChannel)])
+        
+        protected_categories = total_categories - allowed_categories
+        protected_channels = total_channels - allowed_channels - uncategorized
+        
         embed.add_field(
-            name="🔓 Protected (Locked)", 
-            value=f"{total_categories - moveable_categories} categories\n{total_channels - moveable_channels - uncategorized} channels", 
+            name="🔒 Protected (Layout-Locked)", 
+            value=f"{protected_categories} categories\n{protected_channels} channels", 
             inline=True
         )
         
         embed.add_field(
-            name="🔄 Moveable", 
-            value=f"{moveable_categories} categories\n{moveable_channels} channels\n{uncategorized} uncategorized", 
+            name="🔄 Auto-Organize Allowed", 
+            value=f"{allowed_categories} categories\n{allowed_channels} channels\n{uncategorized} uncategorized", 
             inline=True
         )
         
         embed.add_field(
-            name="ℹ️ Info",
-            value="Only channels in **Release Guides** and **Daily Schedule** categories can be moved.\nAll other categories are now layout-protected.",
+            name="ℹ️ Channel Movement Policy",
+            value="**🔒 Protected:** All categories follow server_layout.json exactly.\n**🔄 Allowed:** Only Release Guides & Daily Schedule can auto-organize.\n**⚙️ Manual:** Use `/organize_channels` when needed.",
             inline=False
         )
         

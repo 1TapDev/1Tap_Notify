@@ -423,6 +423,8 @@ contextlib       # Context managers
 functools        # Function utilities
 traceback        # Error tracing
 uuid             # Unique identifiers
+Pillow (PIL)     # Image processing and compression
+io               # In-memory file operations
 ```
 
 ### Infrastructure Requirements
@@ -439,8 +441,13 @@ uuid             # Unique identifiers
 ## Recent Changes & Updates
 
 ### Version History
-- **Latest Commit:** feat(modules): add comprehensive performance and utility modules
+- **Latest Commit:** feat(compression): add intelligent image compression for large files
+- **Previous Commit:** feat(channels): restrict automatic channel moving to specific categories
 - **Key Updates:**
+  - Intelligent image compression system with progressive optimization
+  - Restricted channel management to only 2 specific categories
+  - Server layout protection for all other categories
+  - Enhanced slash commands for manual channel organization
   - Enhanced structured logging system with Unicode support
   - Performance monitoring and memory management modules
   - Configuration file watching with automatic reload
@@ -450,6 +457,7 @@ uuid             # Unique identifiers
 
 ### File Changes Summary
 - **Modified:** `self-bot/main.py` - Reverted automatic attachment-to-embed conversion
+- **Modified:** `destination_bot/bot.py` - Added image compression and restricted channel management
 - **New:** `self-bot/modules/performance.py` - Performance monitoring system
 - **New:** `self-bot/modules/memory_manager.py` - Memory usage tracking
 - **New:** `self-bot/modules/shutdown_handler.py` - Graceful shutdown management
@@ -462,16 +470,19 @@ uuid             # Unique identifiers
 - ✅ Forwarded message detection (3 methods)
 - ✅ Reply handling with gray bars
 - ✅ Role mention mapping
-- ✅ Attachment processing (single instance)
+- ✅ Intelligent image compression for large files
+- ✅ Restricted channel moving (Release Guides & Daily Schedule only)
+- ✅ Server layout protection for all other categories
 - ✅ Native Discord embed processing
 - ✅ Channel combining functionality
 - ✅ Configuration file hot-reloading
 - ✅ Performance monitoring and logging
 
-### Current Status & Testing Needed
-- 🔧 Testing required for embed messages from ❗┃all-staff-pings-divine
-- 🔧 Verification needed for double image prevention
-- ✅ Duplicate image fix reverted to restore embed functionality
+### Current Status
+- ✅ Image compression system working and crash-proof
+- ✅ Channel movement restricted to 2 specific categories only
+- ✅ Server layout protection implemented and active
+- ✅ All-staff-pings embed messages displaying properly
 
 ## Operational Procedures
 
@@ -504,6 +515,60 @@ uuid             # Unique identifiers
 - **Console Output:** Critical errors only
 - **Redis Queues:** Message count monitoring
 - **Connection Status:** Real-time connection health
+
+## Image Compression System
+
+The system includes intelligent image compression for handling large files that exceed Discord's size limits.
+
+### Implementation
+```python
+def compress_image(image_data, filename, max_size=MAX_DISCORD_FILE_SIZE, quality=85):
+    # Progressive quality reduction: 85% → 70% → 55% → 40% → 25% → 10%
+    # Intelligent resizing: 2048px → 1024px → smaller
+    # Format optimization: PNG/GIF → JPEG for better compression
+    # Multi-step approach with error handling
+```
+
+### Key Features
+- **Progressive Compression:** Quality reduction with size monitoring
+- **Intelligent Resizing:** Maintains aspect ratio while reducing dimensions
+- **Format Optimization:** Converts to JPEG for maximum compression
+- **Transparency Handling:** White background for transparent images
+- **Multi-format Support:** JPG, PNG, GIF, WebP, BMP
+- **Error Handling:** Robust PIL processing with multiple fallbacks
+- **Safety Limits:** Max 8 attempts to prevent infinite loops
+
+### Compression Behavior
+**Before:** `⚠️ File too large, skipping: image0.jpg`
+**After:** `🗜️ Image compressed: image0.jpg (15MB → 2.1MB, -86.0%, quality=55)`
+
+## Channel Management System
+
+The system implements restricted automatic channel moving with server layout protection.
+
+### Protected Channel Management
+```python
+# Only these categories allow automatic channel moving
+ALLOWED_CATEGORY_IDS = {1348464705701806080, 1353704482457915433}  # Release Guides, Daily Schedule
+
+async def monitor_allowed_categories_only():
+    # Process only channels in allowed categories
+    # All other categories respect server_layout.json
+```
+
+### Slash Commands
+```python
+/organize_channels - Manual channel organization (admin only)
+/capture_layout - Capture and protect server layout
+/protect - Protect specific channels from deletion
+/unprotect - Remove channel protection
+```
+
+### Key Features
+- **Restricted Movement:** Only Release Guides and Daily Schedule categories
+- **Layout Protection:** All other categories follow server_layout.json exactly
+- **Manual Control:** Admin-only commands for organization
+- **Protection System:** Individual channel protection from auto-deletion
 
 ## Channel Combining Feature
 

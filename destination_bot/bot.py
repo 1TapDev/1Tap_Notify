@@ -8,6 +8,8 @@ import hashlib
 import argparse
 import os
 import time
+import io
+from PIL import Image, ImageOps
 import threading
 import requests
 import re
@@ -145,6 +147,135 @@ WEBHOOKS = config.get("webhooks", {})
 TOKENS = config.get("tokens", {})
 DM_MAPPINGS = config.get("dm_mappings", {})
 MAX_DISCORD_FILE_SIZE = 7.5 * 1024 * 1024  # 7.5MB instead of 8MB
+
+def compress_image(image_data, filename, max_size=MAX_DISCORD_FILE_SIZE, quality=85):
+    """
+    Compress an image to fit under Discord's file size limit.
+    
+    Args:
+        image_data: Binary image data
+        filename: Original filename for format detection
+        max_size: Maximum file size in bytes
+        quality: JPEG compression quality (1-100)
+    
+    Returns:
+        tuple: (compressed_data, new_filename, was_compressed)
+    """
+    try:
+        # Check if it's actually an image
+        original_size = len(image_data)
+        
+        # Detect file type from filename
+        file_ext = filename.lower().split('.')[-1] if '.' in filename else 'jpg'
+        
+        # Skip compression for non-image files
+        if file_ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']:
+            return image_data, filename, False
+            
+        # Load image with PIL
+        try:
+            image = Image.open(io.BytesIO(image_data))
+            # Verify this is actually a valid image
+            image.verify()
+            # Reload the image since verify() can only be called once
+            image = Image.open(io.BytesIO(image_data))
+        except Exception as load_error:
+            logging.warning(f"⚠️ Could not load image {filename}: {load_error}")
+            return image_data, filename, False
+        
+        # Convert RGBA to RGB for JPEG compatibility (preserve transparency for PNG)
+        if image.mode in ('RGBA', 'LA', 'P') and file_ext in ['jpg', 'jpeg']:
+            # Create white background for JPEG
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            if image.mode == 'P':
+                image = image.convert('RGBA')
+            background.paste(image, mask=image.split()[-1] if image.mode in ('RGBA', 'LA') else None)
+            image = background
+        
+        # Start with current quality
+        current_quality = quality
+        max_dimension = max(image.size)
+        attempts = 0
+        max_attempts = 8  # Prevent infinite loops
+        
+        while current_quality > 10 and attempts < max_attempts:  # Minimum quality threshold and safety limit
+            attempts += 1
+            # Resize if image is too large (progressive downsizing)
+            if max_dimension > 2048 and current_quality < 60:
+                ratio = 2048 / max_dimension
+                new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+                resized_image = image.resize(new_size, Image.Resampling.LANCZOS)
+                max_dimension = max(new_size)
+            else:
+                resized_image = image
+            
+            # Compress image
+            output_buffer = io.BytesIO()
+            
+            # Always convert to JPEG for better compression and compatibility
+            # This avoids PNG encoding issues and provides more consistent compression
+            try:
+                # Convert to RGB mode for JPEG compatibility
+                if resized_image.mode in ('RGBA', 'LA', 'P'):
+                    # Create white background for transparency
+                    background = Image.new('RGB', resized_image.size, (255, 255, 255))
+                    if resized_image.mode == 'P':
+                        resized_image = resized_image.convert('RGBA')
+                    if resized_image.mode in ('RGBA', 'LA'):
+                        background.paste(resized_image, mask=resized_image.split()[-1])
+                    else:
+                        background.paste(resized_image)
+                    resized_image = background
+                elif resized_image.mode not in ('RGB', 'L'):
+                    resized_image = resized_image.convert('RGB')
+                
+                # Save as JPEG with quality adjustment
+                resized_image.save(output_buffer, format='JPEG', quality=current_quality, optimize=True)
+                compressed_filename = filename.rsplit('.', 1)[0] + '_compressed.jpg'
+                
+            except Exception as save_error:
+                # If JPEG saving fails, try a more basic approach
+                logging.warning(f"⚠️ JPEG compression failed for {filename}, trying basic conversion: {save_error}")
+                try:
+                    # Convert to basic RGB and try again
+                    rgb_image = Image.new('RGB', resized_image.size, (255, 255, 255))
+                    if resized_image.mode != 'RGB':
+                        resized_image = resized_image.convert('RGB')
+                    rgb_image.paste(resized_image)
+                    rgb_image.save(output_buffer, format='JPEG', quality=current_quality)
+                    compressed_filename = filename.rsplit('.', 1)[0] + '_compressed.jpg'
+                except Exception as final_error:
+                    logging.error(f"❌ Failed to compress {filename} with all methods: {final_error}")
+                    return image_data, filename, False
+            
+            compressed_data = output_buffer.getvalue()
+            compressed_size = len(compressed_data)
+            
+            # Check if compression was successful
+            if compressed_size <= max_size:
+                compression_ratio = (1 - compressed_size / original_size) * 100
+                logging.info(
+                    f"🗜️ Image compressed: {filename} "
+                    f"({original_size//1024}KB → {compressed_size//1024}KB, "
+                    f"-{compression_ratio:.1f}%, quality={current_quality})"
+                )
+                return compressed_data, compressed_filename, True
+            
+            # Reduce quality for next iteration
+            current_quality -= 15
+            
+            # If quality is getting too low, try more aggressive resizing
+            if current_quality < 30 and max_dimension > 1024:
+                max_dimension = max_dimension // 2
+                current_quality = 60  # Reset quality for smaller image
+        
+        # If we couldn't compress enough, return original data
+        logging.warning(f"⚠️ Could not compress {filename} sufficiently. Original size: {original_size//1024}KB")
+        return image_data, filename, False
+        
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to compress image {filename}: {e}")
+        return image_data, filename, False
 
 # Connect to Redis
 redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
@@ -648,7 +779,21 @@ async def send_dm_via_webhook(webhook, message_data):
                                     "data": file_data
                                 })
                             else:
-                                logging.warning(f"⚠️ File too large, skipping: {filename}")
+                                # Try to compress the image before giving up
+                                compressed_data, compressed_filename, was_compressed = compress_image(file_data, filename)
+                                if was_compressed and len(compressed_data) <= MAX_DISCORD_FILE_SIZE:
+                                    files.append({
+                                        "filename": compressed_filename,
+                                        "data": compressed_data
+                                    })
+                                    logging.info(f"✅ Large DM file compressed and attached: {compressed_filename}")
+                                else:
+                                    # Still too large or not an image, send as link
+                                    logging.warning(f"⚠️ DM file too large even after compression, sending as link: {filename}")
+                                    if content:
+                                        payload["content"] = f"{content}\n📎 **Large file:** {url}"
+                                    else:
+                                        payload["content"] = f"📎 **Large file:** {url}"
             except Exception as e:
                 logging.warning(f"⚠️ Failed to fetch attachment: {url} → {e}")
 
@@ -1168,7 +1313,18 @@ async def send_to_webhook(message_data):
                                 "data": file_data
                             })
                         else:
-                            logging.warning(f"⚠️ File too large, skipping: {filename}")
+                            # Try to compress the image before giving up
+                            compressed_data, compressed_filename, was_compressed = compress_image(file_data, filename)
+                            if was_compressed and len(compressed_data) <= MAX_DISCORD_FILE_SIZE:
+                                files.append({
+                                    "filename": compressed_filename,
+                                    "data": compressed_data
+                                })
+                                logging.info(f"✅ Large file compressed and attached: {compressed_filename}")
+                            else:
+                                # Still too large or not an image, send as link in content
+                                logging.warning(f"⚠️ File too large even after compression, adding link to content: {filename}")
+                                content_parts[0] = f"{content_parts[0]}\n📎 **Large file:** {url}" if content_parts[0] else f"📎 **Large file:** {url}"
         except Exception as e:
             logging.warning(f"⚠️ Failed to fetch attachment: {url} → {e}")
 
